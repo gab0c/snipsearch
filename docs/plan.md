@@ -6,7 +6,7 @@
 
 ### Core Value Proposition
 - **Native Assistant Trigger Without Accessibility Abuse:** Uses Android's `VoiceInteractionService` (`ROLE_ASSISTANT`) to receive an on-demand screenshot (`onHandleScreenshot`) and view hierarchy (`onHandleAssist`) strictly at the moment the user invokes it—requiring **zero** `AccessibilityService`, **zero** `SYSTEM_ALERT_WINDOW`, and **zero** persistent background observation.
-- **Coexistence with Secondary Voice Assistants:** Uses AOSP `AssistantInvocationEvent` trigger-source routing (`invocation_type`) so long-pressing the navigation handle opens SnipSearch while long-pressing the power button can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
+- **Coexistence with Secondary Voice Assistants:** Uses AOSP `invocation_type` trigger-source routing so swiping up from a bottom corner (or long-pressing Home in 3-button navigation) opens SnipSearch while long-pressing the power button (the stock Android assistant trigger; GrapheneOS keeps the power menu there) can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
 - **Unified In-App Bottom-Sheet UX:** Mounts a Jetpack Compose `BottomSheetScaffold` hosting the system `WebView` (Vanadium WebView on GrapheneOS) directly inside the `VoiceInteractionSession` window so users can resize the crop box, add follow-up text (*"Add to your search"*), and browse results seamlessly.
 - **100% Offline Text, Entity & QR Extraction:** Extracts native UI text instantaneously from `AssistStructure`, decodes QR/barcodes offline via pure-Kotlin/JVM `ZXing`, and runs **PaddleOCR v4 Mobile** via **ONNX Runtime** inside an air-gapped `android:isolatedProcess="true"` sandbox for pixel-baked text.
 - **GrapheneOS Hardened & Reproducible:** Supports synchronous hardware Memory Tagging (`memtagMode="sync"`), 16KB page sizes, graceful offline degradation when the GrapheneOS Network toggle is disabled, `AndroidKeyStore` StrongBox/TEE encryption for custom API keys, and reproducible multi-ABI GitHub Releases with SLSA Level 3 provenance and `apksigcopier` verification.
@@ -210,12 +210,16 @@ snipsearch/
 
 #### AOSP Invocation Routing (`InvocationRouter.kt`)
 Android 14–16 passes `"invocation_type"` inside `args: Bundle?` to `VoiceInteractionSession.onShow(args, showFlags)`:
-- `INVOCATION_TYPE_GESTURE = 1` (Navigation pill long-press / corner swipe)
-- `INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS = 7` (3-button navigation Home long-press)
-- `INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS = 5` (Long-press Power button)
+- `INVOCATION_TYPE_GESTURE = 1` (Swipe up from a bottom corner in gesture navigation)
+- `INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS = 5` (3-button navigation Home long-press)
+- `INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS = 6` (Long-press Power button. This is the AOSP and stock Pixel default; GrapheneOS reverts long-press power to the power menu and removes the setting, so this value never arrives there)
 - `INVOCATION_TYPE_QUICK_SETTINGS_TILE = 100` (Custom internal constant passed when triggered via `SnipQuickSettingsTileService`)
 
-When `invocationType == 5` (`POWER_BUTTON_LONG_PRESS`):
+The first three values come from the hidden `com.android.internal.app.AssistUtils` class and are identical on the `android14-release`, `android15-release`, and `android16-release` AOSP branches, so `InvocationRouter` defines them itself. Two neighbouring values are **not** SnipSearch triggers: `7` is `INVOCATION_TYPE_ASSIST_BUTTON` (a physical assistant key) and `8` is `INVOCATION_TYPE_NAV_HANDLE_LONG_PRESS` (Android 15+).
+
+Long-pressing the navigation handle does not open the `ROLE_ASSISTANT` app. AOSP's launcher sends it to Contextual Search (`config_defaultContextualSearchPackageName`), which is Circle to Search on stock Pixel and is unset in the AOSP and GrapheneOS framework configuration.
+
+When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
 1. If user setting is `PowerButtonAction.IGNORE`: immediately scrub any queued screenshot/assist references and call `hide()`.
 2. If user setting is `PowerButtonAction.DELEGATE`:
    - Scrub any queued screenshot/assist references.
@@ -501,7 +505,7 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 
 ### Milestone 2: Assistant Role, AOSP Trigger Routing & Memory Scrubber
 - Implement `SnipVoiceInteractionService`, `SnipVoiceInteractionSessionService`, `SnipVoiceInteractionSession`, `SnipRecognitionServiceStub`, and `SnipQuickSettingsTileService`.
-- Implement `InvocationRouter` for AOSP `invocation_type` (`1` Gesture, `7` Home Long-Press, `5` Power Button with delegation to Gemini/external voice assistant or ignore).
+- Implement `InvocationRouter` for AOSP `invocation_type` (`1` Gesture, `5` Home Long-Press, `6` Power Button with delegation to Gemini/external voice assistant or ignore).
 - Implement `MemoryScrubber` and `FLAG_SECURE` null-screenshot handling.
 - **Verification:** Unit tests for `InvocationRouter` and memory scrubbing lifecycle (`onHide()` zeroes byte arrays and recycles bitmaps).
 
