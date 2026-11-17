@@ -61,6 +61,10 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 3. **16KB Page Size & MTE Compatibility (Android 15/16 + GrapheneOS):**
    - Every native `.so` packaged in the APK must have 16KB ELF segment alignment (`-Wl,-z,max-page-size=16384`).
    - `AndroidManifest.xml` must keep `android:memtagMode="sync"` enabled on `<application>`.
+4. **Release Signing Isolation (Protected `release` Environment Only):**
+   - Gradle MUST only ever produce **unsigned** release APKs. Release signing happens exclusively in the `sign-and-attest` job of `release.yml`, inside the protected GitHub `release` Environment (see `docs/plan.md` §5.2 and `SECURITY.md`).
+   - **FORBIDDEN:** Never add a release `signingConfigs` block (or `storeFile` / `storePassword` / `keyAlias` / `keyPassword` values) to any Gradle file, and never make a Gradle build read signing material from `local.properties`, `keystore.properties`, `gradle.properties`, or environment variables. Debug builds use the Android Gradle Plugin's auto-generated debug keystore.
+   - **FORBIDDEN:** AI coding agents must never generate, import, request, read, print, or commit a release keystore, its passwords, or any `release` Environment secret. The release key is created and held only by the human maintainer.
 
 ---
 
