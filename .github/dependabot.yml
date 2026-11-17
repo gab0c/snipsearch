@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Gradle is left out on purpose: Dependabot does not update
+  # gradle/verification-metadata.xml, so its Gradle pull requests would fail
+  # strict dependency verification.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
