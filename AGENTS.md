@@ -1,6 +1,6 @@
 # AGENTS.md — SnipSearch Engineering & Security Constitution
 
-This file defines non-negotiable architectural, security, privacy, and build constraints for **SnipSearch** (`com.snipsearch`), a privacy-first, search-engine-agnostic "Circle to Search" assistant designed primarily for **GrapheneOS** and compatible with **Android 14–16 (API 34–36)**.
+This file defines non-negotiable architectural, security, privacy, and build constraints for **SnipSearch** (`com.snipsearch`), a privacy-first, search-engine-agnostic "Circle to Search" assistant designed primarily for **GrapheneOS** and compatible with **Android 16–17 (API 36–37)**.
 
 All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contributors MUST strictly adhere to these rules on every task, commit, and pull request.
 
@@ -11,7 +11,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 1. **Trigger & Role Mechanism (`VoiceInteractionService` Only):**
    - SnipSearch operates strictly as a Digital Assistant (`android.permission.BIND_VOICE_INTERACTION` / `ROLE_ASSISTANT`) with a companion Quick Settings `TileService` that invokes `showSession()`.
    - **FORBIDDEN:** Never declare or use `AccessibilityService` (`BIND_ACCESSIBILITY_SERVICE`), `SYSTEM_ALERT_WINDOW`, or `MediaProjection` APIs.
-2. **AOSP Trigger-Source Routing (Android 14–16):**
+2. **AOSP Trigger-Source Routing (Android 16–17):**
    - Inspect `args?.getInt("invocation_type", -1)` inside `VoiceInteractionSession.onShow(args: Bundle?, showFlags: Int)` using the AOSP `com.android.internal.app.AssistUtils` `INVOCATION_TYPE_*` values (hidden API, so `InvocationRouter` defines the integers itself):
      - `1` (`INVOCATION_TYPE_GESTURE`, swipe up from a bottom corner in gesture navigation) & `5` (`INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS`, Home long-press in 3-button navigation): Launch the SnipSearch interactive overlay.
      - `6` (`INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS`; never arrives on GrapheneOS, which keeps the power menu on long-press power): Route according to user preference:
@@ -66,7 +66,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
      ```
    - Both passes and the empty `GRADLE_USER_HOME` are required: with a warm cache, or with the `pgp,sha256` pass alone, Gradle omits some parent POMs and BOMs and the result fails on a clean machine. Confirm the result with `./gradlew --dependency-verification strict help build` from a second empty `GRADLE_USER_HOME`.
    - Commit `gradle/verification-metadata.xml` and `gradle/verification-keyring.keys` together. Do not hand-edit checksums or add `<trusted-artifacts>` / `<ignored-keys>` entries to make a build pass; an `<ignored-key>` may only be removed (when the key has become available and is in the keyring).
-3. **16KB Page Size & MTE Compatibility (Android 15/16 + GrapheneOS):**
+3. **16KB Page Size & MTE Compatibility (Android 16/17 + GrapheneOS):**
    - Every native `.so` packaged in the APK must have 16KB ELF segment alignment (`-Wl,-z,max-page-size=16384`).
    - `AndroidManifest.xml` must keep `android:memtagMode="sync"` enabled on `<application>`.
 4. **Release Signing Isolation (Protected `release` Environment Only):**

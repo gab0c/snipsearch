@@ -2,7 +2,7 @@
 
 ## 1. Project Overview & Goals
 
-**SnipSearch** (`com.snipsearch`) is an open-source, search-engine-agnostic "Circle to Search" assistant for **GrapheneOS** and **Android 14–16 (API 34–36)**.
+**SnipSearch** (`com.snipsearch`) is an open-source, search-engine-agnostic "Circle to Search" assistant for **GrapheneOS** and **Android 16–17 (API 36–37)**.
 
 ### Core Value Proposition
 - **Native Assistant Trigger Without Accessibility Abuse:** Uses Android's `VoiceInteractionService` (`ROLE_ASSISTANT`) to receive an on-demand screenshot (`onHandleScreenshot`) and view hierarchy (`onHandleAssist`) strictly at the moment the user invokes it—requiring **zero** `AccessibilityService`, **zero** `SYSTEM_ALERT_WINDOW`, and **zero** persistent background observation.
@@ -17,7 +17,7 @@
 
 | Area | Locked Decision | Rationale |
 | :--- | :--- | :--- |
-| **Target Platform** | Android 14–16 (API 34–36), 100% Kotlin + Jetpack Compose | Modern `VoiceInteractionSession`, `SharedMemory`, and 16KB page-alignment support; zero legacy bloat. |
+| **Target Platform** | Android 16–17 (API 36–37): `minSdk` 36, `targetSdk` 37, `compileSdk` 37. 100% Kotlin + Jetpack Compose | Covers current GrapheneOS (Android 17) and the previous release; modern `VoiceInteractionSession`, `SharedMemory`, and 16KB page-alignment support; zero legacy bloat. See §2.1 for what targeting API 37 changes. |
 | **Assistant Role & Trigger** | `VoiceInteractionService` (`ROLE_ASSISTANT`) + AOSP `invocation_type` routing + Quick Settings `TileService` (`showSession()`) | Zero `AccessibilityService` or `MediaProjection` permissions; coexists with power-button voice assistants. |
 | **Process & Network Model** | Single APK with `INTERNET` + `android:isolatedProcess="true"` OCR service + GrapheneOS Network toggle degradation | Enables native single-window bottom-sheet `WebView` UX while sandboxing native C++ OCR inference and supporting air-gapped OS network revocation. |
 | **Text & Entity Extraction** | Tier 1: `AssistStructure` ViewNode tree<br>Tier 2: Bundled **PaddleOCR v4 Mobile** (`onnxruntime-android >= 1.22.0`) in `/assets/ocr/`<br>Tier 3: Offline `com.google.zxing:core` QR/barcode + Regex URL/Email/Phone chips | Zero disk I/O, zero Play Services, 16KB page-aligned, instant offline utility even without network. |
@@ -27,6 +27,13 @@
 | **Search Providers** | Built-in Presets (Google Lens, Yandex, Bing Visual, SearXNG, Google, DuckDuckGo, Brave, Startpage) + Custom Provider & Vision LLM Builder | Works out-of-the-box for all users while remaining 100% search-engine agnostic. |
 | **Secret Storage** | Zero-dependency `AndroidKeyStore` (`AES-256-GCM`, StrongBox with TEE fallback, `setUnlockedDeviceRequired(true)`) stored in Jetpack `DataStore` | Protects custom API keys/headers against AFU lock-screen state, LFI, and rooted/recovery file extraction across GrapheneOS and Stock Android. |
 | **Release & Supply Chain** | ABI Splits (`arm64-v8a`, `x86_64`) + Universal APK, signed in a protected GitHub `release` Environment + SLSA v1.0 provenance + `apksigcopier` reproducibility | Keeps Pixel/GrapheneOS APK ~18 MB smaller, isolates signing keys from coding agents, and enables cryptographic verification via Obtainium/AppVerifier. |
+
+### 2.1 What Targeting Android 17 (API 37) Changes
+`targetSdk = 37` opts the app into these Android 17 behaviours. Later milestones must account for them:
+- **Local network permission:** connecting to a host on the local network requires the `ACCESS_LOCAL_NETWORK` runtime permission. This only affects a user-configured SearXNG or OpenAI-compatible endpoint on the LAN (for example Ollama). Declare the permission and request it only when the user saves such an endpoint; never request it for the built-in presets.
+- **Certificate Transparency is on by default** for the app's TLS connections. Do not opt out in `network_security_config.xml`.
+- **Orientation, resizability and aspect-ratio locks are ignored on large screens (sw >= 600dp).** The overlay and settings UI must lay out correctly at any window size and must not rely on `screenOrientation`.
+- **Native libraries loaded with `System.load()` must be read-only.** Bundled libraries loaded from the APK with `System.loadLibrary()` are unaffected; never extract and load a `.so` from writable storage.
 
 ---
 
@@ -209,13 +216,13 @@ snipsearch/
 ```
 
 #### AOSP Invocation Routing (`InvocationRouter.kt`)
-Android 14–16 passes `"invocation_type"` inside `args: Bundle?` to `VoiceInteractionSession.onShow(args, showFlags)`:
+Android 16–17 passes `"invocation_type"` inside `args: Bundle?` to `VoiceInteractionSession.onShow(args, showFlags)`:
 - `INVOCATION_TYPE_GESTURE = 1` (Swipe up from a bottom corner in gesture navigation)
 - `INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS = 5` (3-button navigation Home long-press)
 - `INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS = 6` (Long-press Power button. This is the AOSP and stock Pixel default; GrapheneOS reverts long-press power to the power menu and removes the setting, so this value never arrives there)
 - `INVOCATION_TYPE_QUICK_SETTINGS_TILE = 100` (Custom internal constant passed when triggered via `SnipQuickSettingsTileService`)
 
-The first three values come from the hidden `com.android.internal.app.AssistUtils` class and are identical on the `android14-release`, `android15-release`, and `android16-release` AOSP branches, so `InvocationRouter` defines them itself. Two neighbouring values are **not** SnipSearch triggers: `7` is `INVOCATION_TYPE_ASSIST_BUTTON` (a physical assistant key) and `8` is `INVOCATION_TYPE_NAV_HANDLE_LONG_PRESS` (Android 15+).
+The first three values come from the hidden `com.android.internal.app.AssistUtils` class and are identical on the AOSP `android16-release` branch and on GrapheneOS's Android 17 branch, so `InvocationRouter` defines them itself. Two neighbouring values are **not** SnipSearch triggers: `7` is `INVOCATION_TYPE_ASSIST_BUTTON` (a physical assistant key) and `8` is `INVOCATION_TYPE_NAV_HANDLE_LONG_PRESS`.
 
 Long-pressing the navigation handle does not open the `ROLE_ASSISTANT` app. AOSP's launcher sends it to Contextual Search (`config_defaultContextualSearchPackageName`), which is Circle to Search on stock Pixel and is unset in the AOSP and GrapheneOS framework configuration.
 
@@ -407,12 +414,12 @@ For Custom Providers and Vision APIs requiring API keys or custom headers:
 ```kotlin
 android {
     namespace = "com.snipsearch"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.snipsearch"
-        minSdk = 34
-        targetSdk = 36
+        minSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
     }
