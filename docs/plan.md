@@ -6,7 +6,7 @@
 
 ### Core Value Proposition
 - **Native Assistant Trigger Without Accessibility Abuse:** Uses Android's `VoiceInteractionService` (`ROLE_ASSISTANT`) to receive an on-demand screenshot (`onHandleScreenshot`) and view hierarchy (`onHandleAssist`) strictly at the moment the user invokes it—requiring **zero** `AccessibilityService`, **zero** `SYSTEM_ALERT_WINDOW`, and **zero** persistent background observation.
-- **Coexistence with Secondary Voice Assistants:** Uses AOSP `AssistantInvocationEvent` trigger-source routing (`invocation_type`) so long-pressing the navigation handle opens SnipSearch while long-pressing the power button can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
+- **Coexistence with Secondary Voice Assistants:** Uses AOSP `invocation_type` trigger-source routing so swiping up from a bottom corner (or long-pressing Home in 3-button navigation) opens SnipSearch while long-pressing the power button (the stock Android assistant trigger; GrapheneOS keeps the power menu there) can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
 - **Unified In-App Bottom-Sheet UX:** Mounts a Jetpack Compose `BottomSheetScaffold` hosting the system `WebView` (Vanadium WebView on GrapheneOS) directly inside the `VoiceInteractionSession` window so users can resize the crop box, add follow-up text (*"Add to your search"*), and browse results seamlessly.
 - **100% Offline Text, Entity & QR Extraction:** Extracts native UI text instantaneously from `AssistStructure`, decodes QR/barcodes offline via pure-Kotlin/JVM `ZXing`, and runs **PaddleOCR v4 Mobile** via **ONNX Runtime** inside an air-gapped `android:isolatedProcess="true"` sandbox for pixel-baked text.
 - **GrapheneOS Hardened & Reproducible:** Supports synchronous hardware Memory Tagging (`memtagMode="sync"`), 16KB page sizes, graceful offline degradation when the GrapheneOS Network toggle is disabled, `AndroidKeyStore` StrongBox/TEE encryption for custom API keys, and reproducible multi-ABI GitHub Releases with SLSA Level 3 provenance and `apksigcopier` verification.
@@ -24,7 +24,7 @@
 | **Visual Upload Pipeline** | **Hybrid Pipeline:**<br>1. In-WebView Chromium `<form>` POST (via `shouldInterceptRequest` RAM stream) for browser engines<br>2. `HttpsURLConnection` for REST/JSON Vision APIs | Preserves authentic Vanadium/Chromium TLS (JA3/JA4) & HTTP/2/3 fingerprint to prevent VPN CAPTCHAs and allows inline CAPTCHA solving. |
 | **Cookie & Anti-CAPTCHA Policy** | **Smart Cookie Retention (Default)** + Pre-seeded `SOCS` consent cookie + 1-tap "Clear Session" broom button + "Strict Ephemeral" toggle | Prevents endless CAPTCHA loops on Mullvad/Proton VPNs and bypasses EU GDPR consent walls that drop image POST payloads. |
 | **Post-Gesture UX** | **Immediate Visual Search by Default** (Stock Pixel UX) + Unified *"Add to your search"* multimodal bar + selectable OCR/Assist text overlay (with *"Confirm Before Upload"* toggle in Settings) | Matches native Circle to Search responsiveness while keeping offline text selection and multimodal query refinement front-and-center. |
-| **Search Providers** | Built-in Presets (Google Lens, Yandex, Bing Visual, SearXNG, DuckDuckGo, Brave, Startpage, Kagi) + Custom Provider & Vision LLM Builder | Works out-of-the-box for all users while remaining 100% search-engine agnostic. |
+| **Search Providers** | Built-in Presets (Google Lens, Yandex, Bing Visual, SearXNG, Google, DuckDuckGo, Brave, Startpage) + Custom Provider & Vision LLM Builder | Works out-of-the-box for all users while remaining 100% search-engine agnostic. |
 | **Secret Storage** | Zero-dependency `AndroidKeyStore` (`AES-256-GCM`, StrongBox with TEE fallback, `setUnlockedDeviceRequired(true)`) stored in Jetpack `DataStore` | Protects custom API keys/headers against AFU lock-screen state, LFI, and rooted/recovery file extraction across GrapheneOS and Stock Android. |
 | **Release & Supply Chain** | ABI Splits (`arm64-v8a`, `x86_64`) + Universal APK, signed in a protected GitHub `release` Environment + SLSA v1.0 provenance + `apksigcopier` reproducibility | Keeps Pixel/GrapheneOS APK ~18 MB smaller, isolates signing keys from coding agents, and enables cryptographic verification via Obtainium/AppVerifier. |
 
@@ -210,12 +210,16 @@ snipsearch/
 
 #### AOSP Invocation Routing (`InvocationRouter.kt`)
 Android 14–16 passes `"invocation_type"` inside `args: Bundle?` to `VoiceInteractionSession.onShow(args, showFlags)`:
-- `INVOCATION_TYPE_GESTURE = 1` (Navigation pill long-press / corner swipe)
-- `INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS = 7` (3-button navigation Home long-press)
-- `INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS = 5` (Long-press Power button)
+- `INVOCATION_TYPE_GESTURE = 1` (Swipe up from a bottom corner in gesture navigation)
+- `INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS = 5` (3-button navigation Home long-press)
+- `INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS = 6` (Long-press Power button. This is the AOSP and stock Pixel default; GrapheneOS reverts long-press power to the power menu and removes the setting, so this value never arrives there)
 - `INVOCATION_TYPE_QUICK_SETTINGS_TILE = 100` (Custom internal constant passed when triggered via `SnipQuickSettingsTileService`)
 
-When `invocationType == 5` (`POWER_BUTTON_LONG_PRESS`):
+The first three values come from the hidden `com.android.internal.app.AssistUtils` class and are identical on the `android14-release`, `android15-release`, and `android16-release` AOSP branches, so `InvocationRouter` defines them itself. Two neighbouring values are **not** SnipSearch triggers: `7` is `INVOCATION_TYPE_ASSIST_BUTTON` (a physical assistant key) and `8` is `INVOCATION_TYPE_NAV_HANDLE_LONG_PRESS` (Android 15+).
+
+Long-pressing the navigation handle does not open the `ROLE_ASSISTANT` app. AOSP's launcher sends it to Contextual Search (`config_defaultContextualSearchPackageName`), which is Circle to Search on stock Pixel and is unset in the AOSP and GrapheneOS framework configuration.
+
+When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
 1. If user setting is `PowerButtonAction.IGNORE`: immediately scrub any queued screenshot/assist references and call `hide()`.
 2. If user setting is `PowerButtonAction.DELEGATE`:
    - Scrub any queued screenshot/assist references.
@@ -245,6 +249,9 @@ When `invocationType == 5` (`POWER_BUTTON_LONG_PRESS`):
        - The unified **"Add to your search"** (`MultimodalSearchBar`) docked at the top of the bottom sheet.
    - **Privacy Toggle (`Confirm Before Uploading Pixels`):**
      - Available in Settings for users who only want network activity when explicitly confirmed. When enabled, circling runs offline text/QR extraction immediately and waits for a tap on the **"Visual Search"** pill before opening the `WebView` bottom sheet.
+   - **Text Is Never Searched Automatically (Both Modes):**
+     - Extracted text (`AssistStructure`, OCR, QR/barcode payloads) stays on the device until the user selects text and taps search, taps an action chip, or submits the **"Add to your search"** bar.
+     - This covers extracted text only. In Default Mode the cropped image itself, including any text visible in it, is still uploaded immediately.
 
 ---
 
@@ -360,7 +367,7 @@ sealed interface SearchProviderConfig {
 5. **OpenAI-Compatible Vision API (Ollama / OpenWebUI / vLLM / Custom):**
    - Sends base64 WebP image + optional *"Add to your search"* prompt to `/v1/chat/completions` and renders formatted Markdown responses natively inside the bottom sheet.
 6. **Text Search Presets:**
-   - **DuckDuckGo**, **Brave Search**, **Startpage**, **Kagi**.
+   - **Google**, **DuckDuckGo**, **Brave Search**, **Startpage**.
 
 #### Hybrid Upload Pipeline & Anti-CAPTCHA Execution (`WebViewFormUploadBridge.kt`)
 To avoid `HttpsURLConnection` TLS fingerprint mismatches (JA3/JA4) that trigger Google/Yandex/Cloudflare CAPTCHAs on VPNs:
@@ -501,7 +508,7 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 
 ### Milestone 2: Assistant Role, AOSP Trigger Routing & Memory Scrubber
 - Implement `SnipVoiceInteractionService`, `SnipVoiceInteractionSessionService`, `SnipVoiceInteractionSession`, `SnipRecognitionServiceStub`, and `SnipQuickSettingsTileService`.
-- Implement `InvocationRouter` for AOSP `invocation_type` (`1` Gesture, `7` Home Long-Press, `5` Power Button with delegation to Gemini/external voice assistant or ignore).
+- Implement `InvocationRouter` for AOSP `invocation_type` (`1` Gesture, `5` Home Long-Press, `6` Power Button with delegation to Gemini/external voice assistant or ignore).
 - Implement `MemoryScrubber` and `FLAG_SECURE` null-screenshot handling.
 - **Verification:** Unit tests for `InvocationRouter` and memory scrubbing lifecycle (`onHide()` zeroes byte arrays and recycles bitmaps).
 
@@ -518,7 +525,7 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 - **Verification:** Instrumentation/Robolectric tests verifying zero temp files created during OCR and clean recovery if the isolated service is killed.
 
 ### Milestone 5: Hybrid Visual Upload, Bottom-Sheet WebView & Multimodal Search
-- Implement `SearchProviderConfig` schema, `BuiltInProviders` (Google Lens, Yandex, Bing, SearXNG, DuckDuckGo, Brave, Startpage, Kagi, Vision LLM), and `KeystoreSecretCipher` (`AndroidKeyStore` AES-256-GCM).
+- Implement `SearchProviderConfig` schema, `BuiltInProviders` (Google Lens, Yandex, Bing, SearXNG, Google, DuckDuckGo, Brave, Startpage, Vision LLM), and `KeystoreSecretCipher` (`AndroidKeyStore` AES-256-GCM).
 - Implement `WebViewFormUploadBridge` (`shouldInterceptRequest` in-memory multipart `<form>` submission), `RestVisionApiClient` (`HttpsURLConnection`), and `CookieSessionManager` (pre-seeded `SOCS` cookie + Smart Retention + 1-tap Clear Session).
 - Build `SearchWebViewBottomSheet`, `MultimodalSearchBar` (*"Add to your search"*), and `NetworkCapabilityMonitor` (graceful fallback when GrapheneOS Network toggle is OFF).
 - **Verification:** Unit tests for `KeystoreSecretCipher`, provider config serialization, one-time RAM blob interception, and offline degradation.
