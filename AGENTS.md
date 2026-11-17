@@ -65,7 +65,8 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
      ./gradlew --write-verification-metadata pgp,sha256 --export-keys help build
      ```
    - Both passes and the empty `GRADLE_USER_HOME` are required: with a warm cache, or with the `pgp,sha256` pass alone, Gradle omits some parent POMs and BOMs and the result fails on a clean machine. Confirm the result with `./gradlew --dependency-verification strict help build` from a second empty `GRADLE_USER_HOME`.
-   - Commit `gradle/verification-metadata.xml` and `gradle/verification-keyring.keys` together. Do not hand-edit checksums or add `<trusted-artifacts>` / `<ignored-keys>` entries to make a build pass; an `<ignored-key>` may only be removed (when the key has become available and is in the keyring).
+   - Gradle's key server lookups fail intermittently, and each failure is written as an `<ignored-key>` that later runs do not remove. If the result contains `<ignored-keys>`, repeat the second command with `--refresh-keys` added, then delete each `<ignored-key>` whose key now appears in `gradle/verification-keyring.keys`. The committed file should have no `<ignored-keys>`.
+   - Set `<keyring-format>armored</keyring-format>` in the `<configuration>` block so only the reviewable `gradle/verification-keyring.keys` is used, and commit it together with `gradle/verification-metadata.xml`. Do not hand-edit checksums or add `<trusted-artifacts>` / `<ignored-keys>` entries to make a build pass.
 3. **16KB Page Size & MTE Compatibility (Android 16/17 + GrapheneOS):**
    - Every native `.so` packaged in the APK must have 16KB ELF segment alignment (`-Wl,-z,max-page-size=16384`).
    - `AndroidManifest.xml` must keep `android:memtagMode="sync"` enabled on `<application>`.
