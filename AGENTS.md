@@ -51,13 +51,17 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 1. **Forbidden Dependencies:**
    - **NO** Google Play Services (`com.google.android.gms.*`), Firebase (`com.google.firebase.*`), ML Kit (`com.google.mlkit.*`), or proprietary telemetry/analytics/crash-reporting SDKs (Sentry, Crashlytics, Bugsnag, Amplitude, etc.).
    - **NO** third-party HTTP client frameworks (`OkHttp`, `Retrofit`, `Ktor`) unless explicitly approved by the user. Use Android's built-in `javax.net.ssl.HttpsURLConnection` for REST/JSON Vision API calls and the System `WebView` for browser-based multipart searches.
-   - **NO** native JNI libraries other than `com.microsoft.onnxruntime:onnxruntime-android` (`>= 1.22.0`, 16KB page-aligned). QR/barcode decoding must use pure JVM/Kotlin `com.google.zxing:core`.
+   - **NO** native JNI libraries other than `com.microsoft.onnxruntime:onnxruntime-android` (`>= 1.22.0`, 16KB page-aligned) and `libandroidx.graphics.path.so`, which Jetpack Compose pulls in through `androidx.graphics:graphics-path` and loads at runtime (do not exclude it from packaging). QR/barcode decoding must use pure JVM/Kotlin `com.google.zxing:core`.
 2. **Dependency Pinning & Checksum Verification:**
    - All dependencies must be declared in `gradle/libs.versions.toml` with exact version pins (no dynamic `+` versions or snapshot repositories).
    - Any addition or update in `gradle/libs.versions.toml` MUST be accompanied by updating `gradle/verification-metadata.xml` via:
      ```bash
-     ./gradlew --write-verification-metadata pgp,sha256
+     export GRADLE_USER_HOME="$(mktemp -d)"
+     ./gradlew --write-verification-metadata sha256 help build
+     ./gradlew --write-verification-metadata pgp,sha256 --export-keys help build
      ```
+   - Both passes and the empty `GRADLE_USER_HOME` are required: with a warm cache, or with the `pgp,sha256` pass alone, Gradle omits some parent POMs and BOMs and the result fails on a clean machine. Confirm the result with `./gradlew --dependency-verification strict help build` from a second empty `GRADLE_USER_HOME`.
+   - Commit `gradle/verification-metadata.xml` and `gradle/verification-keyring.keys` together. Do not hand-edit checksums or add `<trusted-artifacts>` / `<ignored-keys>` entries to make a build pass; an `<ignored-key>` may only be removed (when the key has become available and is in the keyring).
 3. **16KB Page Size & MTE Compatibility (Android 15/16 + GrapheneOS):**
    - Every native `.so` packaged in the APK must have 16KB ELF segment alignment (`-Wl,-z,max-page-size=16384`).
    - `AndroidManifest.xml` must keep `android:memtagMode="sync"` enabled on `<application>`.
@@ -99,7 +103,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 2. **Standard Verification Commands (Run Before Finishing Any Task):**
    - **Unit & Security Regression Tests:** `./gradlew testDebugUnitTest`
    - **Android Lint Security Gate:** `./gradlew lintRelease`
-   - **Dependency Integrity Check:** `./gradlew --verification-mode strict help`
+   - **Dependency Integrity Check:** `./gradlew --dependency-verification strict help`
    - **Release APK Assembly & 16KB Alignment Check:** `./gradlew assembleRelease`
 3. **Testing Requirements:**
    - Every new domain parser (`AssistStructure` spatial tree, provider schema, URL/QR entity extractor, `AndroidKeyStore` cipher wrapper) must include deterministic JUnit / Robolectric unit tests.

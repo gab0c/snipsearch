@@ -474,17 +474,17 @@ tasks.withType<AbstractArchiveTask>().configureEach {
 All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-level `permissions: contents: read`.
 
 1. **`ci.yml` (Every Push & Pull Request):**
-   - Verifies Gradle dependency checksums (`./gradlew --verification-mode strict help`).
+   - Verifies Gradle dependency checksums (`./gradlew --dependency-verification strict help`).
    - Runs Android Lint security gate (`./gradlew lintRelease`).
    - Runs JUnit / Robolectric unit & security regression tests (`./gradlew testDebugUnitTest`).
-   - Verifies 16KB ELF alignment on all packaged `.so` files using `llvm-objdump -p` (`align 2**14` or `2**16`).
+   - Verifies 16KB ELF alignment on all packaged `.so` files with `scripts/check-elf-alignment.sh` (`readelf -lW`, every `LOAD` segment aligned to a multiple of 16384).
    - Runs `actions/dependency-review-action` on PRs.
 2. **`codeql.yml` (Push to `main`, PRs, Weekly Schedule):**
    - Runs GitHub CodeQL (`java-kotlin` security-extended suite).
 3. **`release.yml` (Tag Push `v*` — Protected `release` Environment):**
    - **Job 1 (`build-unsigned`):** Runs in a clean runner with zero secrets. Builds deterministic unsigned release APKs (`arm64-v8a`, `x86_64`, `universal`) and uploads them with their SHA-256 hashes.
    - **Job 2 (`sign-and-attest`):** Runs inside the protected GitHub Environment `release` (restricted to `refs/tags/v*` tags).
-     - Decodes the release keystore from environment secrets in `RUNNER_TEMP` (`tmpfs`), signs APKs with `apksigner sign --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false`, and immediately shreds the keystore file.
+     - Decodes the release keystore from environment secrets into `/dev/shm` (`tmpfs`), signs APKs with `apksigner sign --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false --alignment-preserved true`, and immediately shreds the keystore file. `--alignment-preserved true` is required: without it `apksigner` re-aligns zip entries and the `apksigcopier compare` step below fails.
      - Verifies reproducibility using `apksigcopier compare` against the unsigned APK from Job 1.
      - Generates SLSA v1.0 build provenance attestations via `actions/attest-build-provenance`.
      - Publishes signed APKs, `.sha256` checksums, and the public signing certificate fingerprint (`SHA-256`) to GitHub Releases for **Obtainium** and **AppVerifier**.
