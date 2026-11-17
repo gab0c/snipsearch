@@ -44,6 +44,9 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
    - **FORBIDDEN:** Do not use the deprecated `androidx.security:security-crypto` library, and never store plaintext credentials in Jetpack `DataStore` or `SharedPreferences`.
 5. **Respect `FLAG_SECURE`:**
    - When `onHandleScreenshot(bitmap: Bitmap?)` receives `null` (because the foreground window set `FLAG_SECURE`), display a brief non-intrusive toast/banner explaining that the screen is protected by `FLAG_SECURE` and call `hide()`.
+6. **No Automatic Text Search:**
+   - Text extracted from the screen (`AssistStructure` text, OCR output, QR/barcode payloads) MUST stay on the device until the user explicitly acts on it: selecting text and tapping search, tapping an action chip, or submitting the *"Add to your search"* bar.
+   - **FORBIDDEN:** Never send extracted text to a search provider, load it into the `WebView`, or hand it to an external browser automatically after the gesture.
 
 ---
 
