@@ -12,12 +12,13 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
    - SnipSearch operates strictly as a Digital Assistant (`android.permission.BIND_VOICE_INTERACTION` / `ROLE_ASSISTANT`) with a companion Quick Settings `TileService` that invokes `showSession()`.
    - **FORBIDDEN:** Never declare or use `AccessibilityService` (`BIND_ACCESSIBILITY_SERVICE`), `SYSTEM_ALERT_WINDOW`, or `MediaProjection` APIs.
 2. **AOSP Trigger-Source Routing (Android 14–16):**
-   - Inspect `args?.getInt("invocation_type", -1)` inside `VoiceInteractionSession.onShow(args: Bundle?, showFlags: Int)` using AOSP `AssistantInvocationEvent` constants:
-     - `1` (`INVOCATION_TYPE_GESTURE`) & `7` (`INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS`): Launch the SnipSearch interactive overlay.
-     - `5` (`INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS`): Route according to user preference:
+   - Inspect `args?.getInt("invocation_type", -1)` inside `VoiceInteractionSession.onShow(args: Bundle?, showFlags: Int)` using the AOSP `com.android.internal.app.AssistUtils` `INVOCATION_TYPE_*` values (hidden API, so `InvocationRouter` defines the integers itself):
+     - `1` (`INVOCATION_TYPE_GESTURE`, swipe up from a bottom corner in gesture navigation) & `5` (`INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS`, Home long-press in 3-button navigation): Launch the SnipSearch interactive overlay.
+     - `6` (`INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS`; never arrives on GrapheneOS, which keeps the power menu on long-press power): Route according to user preference:
        1. *Ignore / Disabled* (`hide()` immediately),
        2. *Delegate to Secondary Voice Assistant* (fire `Intent(Intent.ACTION_VOICE_COMMAND)` to user-selected package and call `hide()`), or
        3. *Trigger SnipSearch Overlay*.
+   - Long-pressing the navigation handle is **not** an assistant trigger: AOSP routes it to Contextual Search, not to the `ROLE_ASSISTANT` app. Never describe or rely on it as a way to open SnipSearch.
 3. **Single-APK + Scoped Network + GrapheneOS Network Toggle Degradation:**
    - The app is a single APK declaring `android.permission.INTERNET` to support the in-app Vanadium/System `WebView` bottom sheet and visual search uploads.
    - If the user revokes the **GrapheneOS Network toggle** (removing `AID_INET` / `GID 3003`), the app MUST NOT crash. It must detect offline state via `ConnectivityManager` / `SocketException`, disable the embedded `WebView` and remote image uploads, and degrade gracefully to offline text/QR extraction (`AssistStructure` + `PaddleOCR` + `ZXing`) and external browser `Intent.ACTION_VIEW` handoff.
