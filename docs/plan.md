@@ -24,7 +24,7 @@
 | **Visual Upload Pipeline** | **Hybrid Pipeline:**<br>1. In-WebView Chromium `<form>` POST (via `shouldInterceptRequest` RAM stream) for browser engines<br>2. `HttpsURLConnection` for REST/JSON Vision APIs | Preserves authentic Vanadium/Chromium TLS (JA3/JA4) & HTTP/2/3 fingerprint to prevent VPN CAPTCHAs and allows inline CAPTCHA solving. |
 | **Cookie & Anti-CAPTCHA Policy** | **Smart Cookie Retention (Default)** + Pre-seeded `SOCS` consent cookie + 1-tap "Clear Session" broom button + "Strict Ephemeral" toggle | Prevents endless CAPTCHA loops on Mullvad/Proton VPNs and bypasses EU GDPR consent walls that drop image POST payloads. |
 | **Post-Gesture UX** | **Immediate Visual Search by Default** (Stock Pixel UX) + Unified *"Add to your search"* multimodal bar + selectable OCR/Assist text overlay (with *"Confirm Before Upload"* toggle in Settings) | Matches native Circle to Search responsiveness while keeping offline text selection and multimodal query refinement front-and-center. |
-| **Search Providers** | Built-in Presets (Google Lens, Yandex, Bing Visual, SearXNG, DuckDuckGo, Brave, Startpage, Kagi) + Custom Provider & Vision LLM Builder | Works out-of-the-box for all users while remaining 100% search-engine agnostic. |
+| **Search Providers** | Built-in Presets (Google Lens, Yandex, Bing Visual, SearXNG, Google, DuckDuckGo, Brave, Startpage) + Custom Provider & Vision LLM Builder | Works out-of-the-box for all users while remaining 100% search-engine agnostic. |
 | **Secret Storage** | Zero-dependency `AndroidKeyStore` (`AES-256-GCM`, StrongBox with TEE fallback, `setUnlockedDeviceRequired(true)`) stored in Jetpack `DataStore` | Protects custom API keys/headers against AFU lock-screen state, LFI, and rooted/recovery file extraction across GrapheneOS and Stock Android. |
 | **Release & Supply Chain** | ABI Splits (`arm64-v8a`, `x86_64`) + Universal APK, signed in a protected GitHub `release` Environment + SLSA v1.0 provenance + `apksigcopier` reproducibility | Keeps Pixel/GrapheneOS APK ~18 MB smaller, isolates signing keys from coding agents, and enables cryptographic verification via Obtainium/AppVerifier. |
 
@@ -367,7 +367,7 @@ sealed interface SearchProviderConfig {
 5. **OpenAI-Compatible Vision API (Ollama / OpenWebUI / vLLM / Custom):**
    - Sends base64 WebP image + optional *"Add to your search"* prompt to `/v1/chat/completions` and renders formatted Markdown responses natively inside the bottom sheet.
 6. **Text Search Presets:**
-   - **DuckDuckGo**, **Brave Search**, **Startpage**, **Kagi**.
+   - **Google**, **DuckDuckGo**, **Brave Search**, **Startpage**.
 
 #### Hybrid Upload Pipeline & Anti-CAPTCHA Execution (`WebViewFormUploadBridge.kt`)
 To avoid `HttpsURLConnection` TLS fingerprint mismatches (JA3/JA4) that trigger Google/Yandex/Cloudflare CAPTCHAs on VPNs:
@@ -525,7 +525,7 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 - **Verification:** Instrumentation/Robolectric tests verifying zero temp files created during OCR and clean recovery if the isolated service is killed.
 
 ### Milestone 5: Hybrid Visual Upload, Bottom-Sheet WebView & Multimodal Search
-- Implement `SearchProviderConfig` schema, `BuiltInProviders` (Google Lens, Yandex, Bing, SearXNG, DuckDuckGo, Brave, Startpage, Kagi, Vision LLM), and `KeystoreSecretCipher` (`AndroidKeyStore` AES-256-GCM).
+- Implement `SearchProviderConfig` schema, `BuiltInProviders` (Google Lens, Yandex, Bing, SearXNG, Google, DuckDuckGo, Brave, Startpage, Vision LLM), and `KeystoreSecretCipher` (`AndroidKeyStore` AES-256-GCM).
 - Implement `WebViewFormUploadBridge` (`shouldInterceptRequest` in-memory multipart `<form>` submission), `RestVisionApiClient` (`HttpsURLConnection`), and `CookieSessionManager` (pre-seeded `SOCS` cookie + Smart Retention + 1-tap Clear Session).
 - Build `SearchWebViewBottomSheet`, `MultimodalSearchBar` (*"Add to your search"*), and `NetworkCapabilityMonitor` (graceful fallback when GrapheneOS Network toggle is OFF).
 - **Verification:** Unit tests for `KeystoreSecretCipher`, provider config serialization, one-time RAM blob interception, and offline degradation.
