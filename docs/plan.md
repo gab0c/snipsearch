@@ -249,6 +249,9 @@ When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
        - The unified **"Add to your search"** (`MultimodalSearchBar`) docked at the top of the bottom sheet.
    - **Privacy Toggle (`Confirm Before Uploading Pixels`):**
      - Available in Settings for users who only want network activity when explicitly confirmed. When enabled, circling runs offline text/QR extraction immediately and waits for a tap on the **"Visual Search"** pill before opening the `WebView` bottom sheet.
+   - **Text Is Never Searched Automatically (Both Modes):**
+     - Extracted text (`AssistStructure`, OCR, QR/barcode payloads) stays on the device until the user selects text and taps search, taps an action chip, or submits the **"Add to your search"** bar.
+     - This covers extracted text only. In Default Mode the cropped image itself, including any text visible in it, is still uploaded immediately.
 
 ---
 
