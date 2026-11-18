@@ -30,7 +30,7 @@
 
 ### 2.1 What Targeting Android 17 (API 37) Changes
 `targetSdk = 37` opts the app into these Android 17 behaviours. Later milestones must account for them:
-- **Local network permission:** connecting to a host on the local network requires the `ACCESS_LOCAL_NETWORK` runtime permission. This only affects a user-configured SearXNG or OpenAI-compatible endpoint on the LAN (for example Ollama). Declare the permission and request it only when the user saves such an endpoint; never request it for the built-in presets.
+- **Local network endpoints are not supported for now:** on Android 17, connecting to a host on the local network requires the `ACCESS_LOCAL_NETWORK` runtime permission, which SnipSearch does not declare or request. A user-configured SearXNG or OpenAI-compatible endpoint on the LAN (for example a self-hosted SearXNG or Ollama) is therefore not supported on Android 17. Built-in presets and internet-hosted endpoints are unaffected. No milestone covers this.
 - **Certificate Transparency is on by default** for the app's TLS connections. Do not opt out in `network_security_config.xml`.
 - **Orientation, resizability and aspect-ratio locks are ignored on large screens (sw >= 600dp).** The overlay and settings UI must lay out correctly at any window size and must not rely on `screenOrientation`.
 - **Native libraries loaded with `System.load()` must be read-only.** Bundled libraries loaded from the APK with `System.loadLibrary()` are unaffected; never extract and load a `.so` from writable storage.
@@ -375,6 +375,8 @@ sealed interface SearchProviderConfig {
    - Sends base64 WebP image + optional *"Add to your search"* prompt to `/v1/chat/completions` and renders formatted Markdown responses natively inside the bottom sheet.
 6. **Text Search Presets:**
    - **Google**, **DuckDuckGo**, **Brave Search**, **Startpage**.
+
+User-configured endpoints (a SearXNG instance URL, an OpenAI-compatible API, or a custom provider) on the local network are not supported on Android 17 for now, because the app does not request `ACCESS_LOCAL_NETWORK` (see §2.1). Built-in presets and internet-hosted endpoints are unaffected.
 
 #### Hybrid Upload Pipeline & Anti-CAPTCHA Execution (`WebViewFormUploadBridge.kt`)
 To avoid `HttpsURLConnection` TLS fingerprint mismatches (JA3/JA4) that trigger Google/Yandex/Cloudflare CAPTCHAs on VPNs:
