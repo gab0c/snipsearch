@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-unsigned:
+    name: Build unsigned APKs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # No cache: a release is always built from freshly downloaded, verified dependencies.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: true
+
+      - name: Assemble unsigned release APKs
+        run: ./gradlew --dependency-verification strict --no-daemon assembleRelease
+
+      - name: Collect APKs and checksums
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for abi in arm64-v8a x86_64 universal; do
+            cp "app/build/outputs/apk/release/app-${abi}-release-unsigned.apk" \
+              "dist/snipsearch-${version}-${abi}-unsigned.apk"
+          done
+          (cd dist && sha256sum -- *.apk > SHA256SUMS)
+
+      - name: Check 16 KB ELF alignment
+        run: scripts/check-elf-alignment.sh dist/*.apk
+
+      - name: Upload unsigned APKs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-apks
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-and-attest:
+    name: Sign, attest, publish
+    needs: build-unsigned
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download unsigned APKs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-apks
+          path: unsigned
+
+      - name: Verify unsigned APK checksums
+        run: cd unsigned && sha256sum --check --strict SHA256SUMS
+
+      - name: Install apksigcopier
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends apksigcopier
+
+      - name: Sign APKs
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          echo "Using build-tools at $build_tools"
+
+          # /dev/shm is tmpfs, so the keystore never reaches the runner's disk.
+          keystore="$(mktemp -p /dev/shm)"
+          trap 'shred -u "$keystore"' EXIT
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+
+          # --alignment-preserved keeps the zip layout Gradle produced. Without it apksigner
+          # re-aligns entries and the signed APK is no longer "unsigned APK + signature",
+          # which is what apksigcopier compare checks.
+          mkdir -p signed
+          for unsigned_apk in unsigned/*-unsigned.apk; do
+            signed_apk="signed/$(basename "${unsigned_apk%-unsigned.apk}").apk"
+            "$build_tools/apksigner" sign \
+              --ks "$keystore" \
+              --ks-key-alias "$RELEASE_KEY_ALIAS" \
+              --ks-pass env:RELEASE_KEYSTORE_PASSWORD \
+              --key-pass env:RELEASE_KEY_PASSWORD \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --v4-signing-enabled false \
+              --alignment-preserved true \
+              --out "$signed_apk" \
+              "$unsigned_apk"
+          done
+
+      - name: Verify signatures and reproducibility
+        run: |
+          set -euo pipefail
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          export PATH="$build_tools:$PATH"
+
+          for signed_apk in signed/*.apk; do
+            unsigned_apk="unsigned/$(basename "${signed_apk%.apk}")-unsigned.apk"
+            apksigner verify --verbose "$signed_apk"
+            zipalign -c -P 16 4 "$signed_apk"
+            apksigcopier compare "$signed_apk" --unsigned "$unsigned_apk"
+          done
+
+          first_apk="$(find signed -name '*.apk' | sort | head -n 1)"
+          apksigner verify --print-certs "$first_apk" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+            > signed/signing-certificate-sha256.txt
+          test -s signed/signing-certificate-sha256.txt
+
+          cd signed
+          for apk in *.apk; do
+            sha256sum -- "$apk" > "$apk.sha256"
+          done
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: signed/*.apk
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            signed/*.apk signed/*.sha256 signed/signing-certificate-sha256.txt
