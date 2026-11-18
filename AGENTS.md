@@ -1,6 +1,6 @@
 # AGENTS.md — SnipSearch Engineering & Security Constitution
 
-This file defines non-negotiable architectural, security, privacy, and build constraints for **SnipSearch** (`com.snipsearch`), a privacy-first, search-engine-agnostic "Circle to Search" assistant designed primarily for **GrapheneOS** and compatible with **Android 14–16 (API 34–36)**.
+This file defines non-negotiable architectural, security, privacy, and build constraints for **SnipSearch** (`com.snipsearch`), a privacy-first, search-engine-agnostic "Circle to Search" assistant designed primarily for **GrapheneOS** and compatible with **Android 16–17 (API 36–37)**.
 
 All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contributors MUST strictly adhere to these rules on every task, commit, and pull request.
 
@@ -11,7 +11,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 1. **Trigger & Role Mechanism (`VoiceInteractionService` Only):**
    - SnipSearch operates strictly as a Digital Assistant (`android.permission.BIND_VOICE_INTERACTION` / `ROLE_ASSISTANT`) with a companion Quick Settings `TileService` that invokes `showSession()`.
    - **FORBIDDEN:** Never declare or use `AccessibilityService` (`BIND_ACCESSIBILITY_SERVICE`), `SYSTEM_ALERT_WINDOW`, or `MediaProjection` APIs.
-2. **AOSP Trigger-Source Routing (Android 14–16):**
+2. **AOSP Trigger-Source Routing (Android 16–17):**
    - Inspect `args?.getInt("invocation_type", -1)` inside `VoiceInteractionSession.onShow(args: Bundle?, showFlags: Int)` using the AOSP `com.android.internal.app.AssistUtils` `INVOCATION_TYPE_*` values (hidden API, so `InvocationRouter` defines the integers itself):
      - `1` (`INVOCATION_TYPE_GESTURE`, swipe up from a bottom corner in gesture navigation) & `5` (`INVOCATION_TYPE_HOME_BUTTON_LONG_PRESS`, Home long-press in 3-button navigation): Launch the SnipSearch interactive overlay.
      - `6` (`INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS`; never arrives on GrapheneOS, which keeps the power menu on long-press power): Route according to user preference:
@@ -55,14 +55,19 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 1. **Forbidden Dependencies:**
    - **NO** Google Play Services (`com.google.android.gms.*`), Firebase (`com.google.firebase.*`), ML Kit (`com.google.mlkit.*`), or proprietary telemetry/analytics/crash-reporting SDKs (Sentry, Crashlytics, Bugsnag, Amplitude, etc.).
    - **NO** third-party HTTP client frameworks (`OkHttp`, `Retrofit`, `Ktor`) unless explicitly approved by the user. Use Android's built-in `javax.net.ssl.HttpsURLConnection` for REST/JSON Vision API calls and the System `WebView` for browser-based multipart searches.
-   - **NO** native JNI libraries other than `com.microsoft.onnxruntime:onnxruntime-android` (`>= 1.22.0`, 16KB page-aligned). QR/barcode decoding must use pure JVM/Kotlin `com.google.zxing:core`.
+   - **NO** native JNI libraries other than `com.microsoft.onnxruntime:onnxruntime-android` (`>= 1.22.0`, 16KB page-aligned) and `libandroidx.graphics.path.so`, which Jetpack Compose pulls in through `androidx.graphics:graphics-path` and loads at runtime (do not exclude it from packaging). QR/barcode decoding must use pure JVM/Kotlin `com.google.zxing:core`.
 2. **Dependency Pinning & Checksum Verification:**
    - All dependencies must be declared in `gradle/libs.versions.toml` with exact version pins (no dynamic `+` versions or snapshot repositories).
    - Any addition or update in `gradle/libs.versions.toml` MUST be accompanied by updating `gradle/verification-metadata.xml` via:
      ```bash
-     ./gradlew --write-verification-metadata pgp,sha256
+     export GRADLE_USER_HOME="$(mktemp -d)"
+     ./gradlew --write-verification-metadata sha256 help build
+     ./gradlew --write-verification-metadata pgp,sha256 --export-keys help build
      ```
-3. **16KB Page Size & MTE Compatibility (Android 15/16 + GrapheneOS):**
+   - Both passes and the empty `GRADLE_USER_HOME` are required: with a warm cache, or with the `pgp,sha256` pass alone, Gradle omits some parent POMs and BOMs and the result fails on a clean machine. Confirm the result with `./gradlew --dependency-verification strict help build` from a second empty `GRADLE_USER_HOME`.
+   - Gradle's key server lookups fail intermittently, and each failure is written as an `<ignored-key>` that later runs do not remove. If the result contains `<ignored-keys>`, repeat the second command with `--refresh-keys` added, then delete each `<ignored-key>` whose key now appears in `gradle/verification-keyring.keys`. The committed file should have no `<ignored-keys>`.
+   - Set `<keyring-format>armored</keyring-format>` in the `<configuration>` block so only the reviewable `gradle/verification-keyring.keys` is used, and commit it together with `gradle/verification-metadata.xml`. Do not hand-edit checksums or add `<trusted-artifacts>` / `<ignored-keys>` entries to make a build pass.
+3. **16KB Page Size & MTE Compatibility (Android 16/17 + GrapheneOS):**
    - Every native `.so` packaged in the APK must have 16KB ELF segment alignment (`-Wl,-z,max-page-size=16384`).
    - `AndroidManifest.xml` must keep `android:memtagMode="sync"` enabled on `<application>`.
 4. **Release Signing Isolation (Protected `release` Environment Only):**
@@ -103,7 +108,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 2. **Standard Verification Commands (Run Before Finishing Any Task):**
    - **Unit & Security Regression Tests:** `./gradlew testDebugUnitTest`
    - **Android Lint Security Gate:** `./gradlew lintRelease`
-   - **Dependency Integrity Check:** `./gradlew --verification-mode strict help`
+   - **Dependency Integrity Check:** `./gradlew --dependency-verification strict help`
    - **Release APK Assembly & 16KB Alignment Check:** `./gradlew assembleRelease`
 3. **Testing Requirements:**
    - Every new domain parser (`AssistStructure` spatial tree, provider schema, URL/QR entity extractor, `AndroidKeyStore` cipher wrapper) must include deterministic JUnit / Robolectric unit tests.

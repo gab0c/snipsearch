@@ -2,6 +2,12 @@
 .gradle/
 build/
 
+# Kotlin compiler session files
+.kotlin/
+
+# Binary keyring Gradle writes during metadata generation; the armored .keys file is the committed one
+gradle/verification-keyring.gpg
+
 # Local configuration file (sdk path, etc)
 local.properties
 
