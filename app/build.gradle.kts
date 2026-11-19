@@ -74,6 +74,14 @@ android {
             "HardcodedDebugMode",
         )
     }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+}
+
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    maxHeapSize = "2g"
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {
@@ -85,4 +93,8 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.material3)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.robolectric.android.all.instrumented)
 }
