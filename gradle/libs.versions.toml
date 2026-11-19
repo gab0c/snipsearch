@@ -3,11 +3,18 @@ agp = "9.5.1"
 kotlin = "2.4.21"
 composeBom = "2026.09.00"
 activityCompose = "1.13.0"
+junit = "4.13.2"
+robolectric = "4.18.1"
+# API 36 jar that Robolectric 4.18.1 loads for sdk=36 (BAKLAVA, 16-robolectric-13921718-2-i7).
+robolectricAndroidAll = "16-robolectric-13921718-2-i7"
 
 [libraries]
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+robolectric-android-all-instrumented = { group = "org.robolectric", name = "android-all-instrumented", version.ref = "robolectricAndroidAll" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

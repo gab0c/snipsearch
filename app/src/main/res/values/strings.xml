@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">SnipSearch</string>
+    <string name="tile_label">SnipSearch</string>
+    <string name="tile_subtitle_ready">Capture this screen</string>
+    <string name="tile_subtitle_needs_role">Set as assistant</string>
+    <string name="session_title">SnipSearch</string>
+    <string name="notice_screen_access_disabled">Screen content access is off in system settings</string>
+    <string name="notice_secure_window">This screen is protected and can\'t be captured</string>
+    <string name="session_screenshot_description">Captured screen</string>
 </resources>
