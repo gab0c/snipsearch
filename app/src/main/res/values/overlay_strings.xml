@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="overlay_close">Close</string>
+    <string name="overlay_select_region">Circle or tap an area to select it</string>
+    <string name="overlay_lock_selection">Lock selection</string>
+    <string name="overlay_reselect">Start over</string>
+    <string name="overlay_crop_failed">Couldn’t crop this screenshot</string>
+    <string name="overlay_waiting_text">Looking for text…</string>
+    <string name="overlay_select_text">Tap a word or drag to select text</string>
+    <string name="overlay_no_text">No selectable text found</string>
+    <string name="overlay_scanning_codes">Looking for QR codes and barcodes…</string>
+    <string name="overlay_no_codes">No codes in this area</string>
+    <string name="overlay_text_mode">Text</string>
+    <string name="overlay_image_mode">Select image</string>
+    <string name="overlay_open_url">Open %1$s</string>
+    <string name="overlay_email">Email %1$s</string>
+    <string name="overlay_dial">Dial %1$s</string>
+    <string name="overlay_copy_coupon">Copy coupon %1$s</string>
+    <string name="overlay_copy_tracking">Copy tracking code %1$s</string>
+    <string name="overlay_copy_qr">Copy QR code</string>
+    <string name="overlay_copy_barcode">Copy barcode</string>
+    <string name="overlay_copy_text">Copy text</string>
+    <string name="overlay_clip_label">SnipSearch selection</string>
+    <string name="overlay_no_action_app">No app could open this selection</string>
+</resources>
