@@ -8,7 +8,7 @@
 - **Native Assistant Trigger Without Accessibility Abuse:** Uses Android's `VoiceInteractionService` (`ROLE_ASSISTANT`) to receive an on-demand screenshot (`onHandleScreenshot`) and view hierarchy (`onHandleAssist`) strictly at the moment the user invokes it—requiring **zero** `AccessibilityService`, **zero** `SYSTEM_ALERT_WINDOW`, and **zero** persistent background observation.
 - **Coexistence with Secondary Voice Assistants:** Uses AOSP `invocation_type` trigger-source routing so swiping up from a bottom corner (or long-pressing Home in 3-button navigation) opens SnipSearch while long-pressing the power button (the stock Android assistant trigger; GrapheneOS keeps the power menu there) can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
 - **Unified In-App Bottom-Sheet UX:** Mounts a Jetpack Compose `BottomSheetScaffold` hosting the system `WebView` (Vanadium WebView on GrapheneOS) directly inside the `VoiceInteractionSession` window so users can resize the crop box, add follow-up text (*"Add to your search"*), and browse results seamlessly.
-- **100% Offline Text, Entity & QR Extraction:** Extracts native UI text instantaneously from `AssistStructure`, decodes QR/barcodes offline via pure-Kotlin/JVM `ZXing`, and runs **PaddleOCR v4 Mobile** via **ONNX Runtime** inside an air-gapped `android:isolatedProcess="true"` sandbox for pixel-baked text.
+- **100% Offline Text, Entity & QR Extraction:** Uses **PaddleOCR v4 Mobile** via **ONNX Runtime** in an air-gapped `android:isolatedProcess="true"` sandbox for on-screen text and its positions. `AssistStructure` supplies correction hints and fallback text. Pure JVM `ZXing` decodes QR codes and barcodes.
 - **GrapheneOS Hardened & Reproducible:** Supports synchronous hardware Memory Tagging (`memtagMode="sync"`), 16KB page sizes, graceful offline degradation when the GrapheneOS Network toggle is disabled, `AndroidKeyStore` StrongBox/TEE encryption for custom API keys, and reproducible multi-ABI GitHub Releases with SLSA Level 3 provenance and `apksigcopier` verification.
 
 ---
@@ -20,10 +20,10 @@
 | **Target Platform** | Android 16–17 (API 36–37): `minSdk` 36, `targetSdk` 37, `compileSdk` 37. 100% Kotlin + Jetpack Compose | Covers current GrapheneOS (Android 17) and the previous release; modern `VoiceInteractionSession`, `SharedMemory`, and 16KB page-alignment support; zero legacy bloat. See §2.1 for what targeting API 37 changes. |
 | **Assistant Role & Trigger** | `VoiceInteractionService` (`ROLE_ASSISTANT`) + AOSP `invocation_type` routing + Quick Settings `TileService` (`showSession()`) | Zero `AccessibilityService` or `MediaProjection` permissions; coexists with power-button voice assistants. |
 | **Process & Network Model** | Single APK with `INTERNET` + `android:isolatedProcess="true"` OCR service + GrapheneOS Network toggle degradation | Enables native single-window bottom-sheet `WebView` UX while sandboxing native C++ OCR inference and supporting air-gapped OS network revocation. |
-| **Text & Entity Extraction** | Tier 1: `AssistStructure` ViewNode tree<br>Tier 2: Bundled **PaddleOCR v4 Mobile** (`onnxruntime-android >= 1.22.0`) in `/assets/ocr/`<br>Tier 3: Offline `com.google.zxing:core` QR/barcode + Regex URL/Email/Phone chips | Zero disk I/O, zero Play Services, 16KB page-aligned, instant offline utility even without network. |
+| **Text & Entity Extraction** | Primary: Bundled **PaddleOCR v4 Mobile** (`onnxruntime-android >= 1.22.0`) in `/assets/ocr/`<br>Hints and fallback: `AssistStructure` ViewNode tree<br>Offline `com.google.zxing:core` QR/barcode and regex URL/email/phone chips | Screenshot-based word positions, zero disk I/O, zero Play Services, and 16KB page alignment. |
 | **Visual Upload Pipeline** | **Hybrid Pipeline:**<br>1. In-WebView Chromium `<form>` POST (via `shouldInterceptRequest` RAM stream) for browser engines<br>2. `HttpsURLConnection` for REST/JSON Vision APIs | Preserves authentic Vanadium/Chromium TLS (JA3/JA4) & HTTP/2/3 fingerprint to prevent VPN CAPTCHAs and allows inline CAPTCHA solving. |
 | **Cookie & Anti-CAPTCHA Policy** | **Smart Cookie Retention (Default)** + Pre-seeded `SOCS` consent cookie + 1-tap "Clear Session" broom button + "Strict Ephemeral" toggle | Prevents endless CAPTCHA loops on Mullvad/Proton VPNs and bypasses EU GDPR consent walls that drop image POST payloads. |
-| **Post-Gesture UX** | **Immediate Visual Search by Default** (Stock Pixel UX) + Unified *"Add to your search"* multimodal bar + selectable OCR/Assist text overlay (with *"Confirm Before Upload"* toggle in Settings) | Matches native Circle to Search responsiveness while keeping offline text selection and multimodal query refinement front-and-center. |
+| **Post-Gesture UX** | Text selection on the frozen screen, an explicit **Search** action for image crops, and a unified *"Add to your search"* bar. The *"Confirm Before Uploading Pixels"* setting gates image upload. | Keeps offline text selection separate from image upload and supports multimodal refinement. |
 | **Search Providers** | Built-in Presets (Google Lens, Yandex, Bing Visual, SearXNG, Google, DuckDuckGo, Brave, Startpage) + Custom Provider & Vision LLM Builder | Works out-of-the-box for all users while remaining 100% search-engine agnostic. |
 | **Secret Storage** | Zero-dependency `AndroidKeyStore` (`AES-256-GCM`, StrongBox with TEE fallback, `setUnlockedDeviceRequired(true)`) stored in Jetpack `DataStore` | Protects custom API keys/headers against AFU lock-screen state, LFI, and rooted/recovery file extraction across GrapheneOS and Stock Android. |
 | **Release & Supply Chain** | ABI Splits (`arm64-v8a`, `x86_64`) + Universal APK, signed in a protected GitHub `release` Environment + SLSA v1.0 provenance + `apksigcopier` reproducibility | Keeps Pixel/GrapheneOS APK ~18 MB smaller, isolates signing keys from coding agents, and enables cryptographic verification via Obtainium/AppVerifier. |
@@ -238,44 +238,42 @@ When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
 
 ### 4.2 Interactive Overlay, Gesture Capture & Post-Gesture UX
 
-1. **Frozen Screen Presentation:**
-   - `onHandleScreenshot(bitmap: Bitmap?)` receives the hardware-composited screen bitmap.
-   - If `bitmap == null` (`FLAG_SECURE` active on foreground window), show a non-intrusive security pill (*"Screen capture blocked by app security policy (FLAG_SECURE)"*) for 1.5s and call `hide()`.
-   - Otherwise, render the frozen screenshot full-screen inside a Compose `Canvas` with a subtle dim scrim and animated shimmer border.
-2. **Freeform Circle / Lasso / Tap Gesture (`GestureLassoCanvas.kt`):**
-   - Tracks `pointerInput` drag paths (`androidx.compose.ui.graphics.Path`).
-   - Computes the bounding `RectF` of the user's stroke (padded slightly and coerced to screen bounds) and transitions smoothly into an `AdjustableCropBox` with 4 draggable corner handles.
-   - **Memory Hygiene:** Once the user lifts their finger and the initial crop is created, keep only the full screenshot in a guarded session holder while the user is actively adjusting crop handles; as soon as the session hides or the user locks the crop, recycle and zero-out the uncropped buffer.
-3. **Post-Gesture Immediate Dual Pipeline:**
-   - **Default Mode (`Immediate Auto-Search`):**
-     - Immediately crops the selected `Rect` into an in-memory `Bitmap` and strips metadata by encoding to an in-memory `WebP` (`quality = 90`) or `PNG` `ByteArray`.
-     - Slides up the `SearchWebViewBottomSheet` to a 55% peek height and initiates the visual search upload to the active provider.
-     - Simultaneously runs the **Offline Extraction Pipeline** (`AssistStructureParser` -> `EntityAndQrDetector` -> `OcrClientCoordinator`) and overlays:
-       - Interactive selectable text highlights directly over the cropped region (`SelectableTextLayer`).
-       - Floating `EntityActionChipsRow` (e.g., **"Open URL"**, **"Copy QR"**, **"Copy All Text"**, **"Email"**, **"Call"**).
-       - The unified **"Add to your search"** (`MultimodalSearchBar`) docked at the top of the bottom sheet.
-   - **Privacy Toggle (`Confirm Before Uploading Pixels`):**
-     - Available in Settings for users who only want network activity when explicitly confirmed. When enabled, circling runs offline text/QR extraction immediately and waits for a tap on the **"Visual Search"** pill before opening the `WebView` bottom sheet.
-   - **Text Is Never Searched Automatically (Both Modes):**
-     - Extracted text (`AssistStructure`, OCR, QR/barcode payloads) stays on the device until the user selects text and taps search, taps an action chip, or submits the **"Add to your search"** bar.
-     - This covers extracted text only. In Default Mode the cropped image itself, including any text visible in it, is still uploaded immediately.
+1. **Frozen screen and floating controls**
+   - Use the session's full drawing area for the screenshot. Anchor translucent controls above it and apply system insets to the controls. Moving or resizing a card must preserve the screenshot's scale, position, and selection coordinates.
+   - Treat protected and unavailable captures according to §4.1.
+2. **Text selection**
+   - Start in text mode. Tap a word to select it, drag across words to select a range, and adjust either endpoint with a handle. Draw the highlight over the screenshot pixels at their existing positions.
+   - Offer **Copy text** for the selected range and entity actions based on that range. Put explicitly copied text on the standard Android clipboard as plain text. Keep the assistant and current selection open so the user can search after copying. Keep extracted text local until the user chooses an action.
+   - On-device follow-up for the Android clipboard preview. Check whether the preview can receive taps while the assistant remains open and the selection is preserved.
+   - Keep the frozen screen in RAM for the duration of text selection and scrub session buffers on hide.
+3. **Image selection**
+   - **Select image** activates the lasso and corner handles for choosing image pixels. Scan that region for QR codes and barcodes offline. When the crop locks, keep the crop at its original screen coordinates and scrub the full screenshot.
+   - In milestone 5, replace **Lock selection** with **Search**. Tapping **Search** commits the crop and starts the visual search flow. Show the bottom sheet at a 55% peek height with **Add to your search**. Honour **Confirm Before Uploading Pixels** by waiting for a separate upload confirmation when enabled. Re-encode the crop in RAM before upload. Send extracted text only through an explicit user action.
+
+#### Glowing feedback and gesture intent
+
+- Use the same thick white finger trail and blue fingertip halo for text and image drags. Keep the full white stroke until release, including while the finger pauses. Ignore small touch jitter. Outline the white trail so it stays visible on light backgrounds. Each blue halo sample fades over 240 ms. Acceleration narrows newly drawn samples. Clear the trail and halo when the finger lifts or the gesture is cancelled. A completed text gesture leaves the regular highlight and handles. A completed image lasso leaves a thick white border with 64 dp corner touch targets. Choose the nearest corner when targets overlap. Keep the screenshot's position and scale fixed throughout.
+- Give an existing text or crop handle first claim on the gesture. For a new stroke, show a neutral preview while intent is unclear. On release, treat a closed or nearly closed path that encloses enough area as an image lasso, including a rough square or rectangle. Treat an open path that follows visible words or crosses adjacent text lines as text selection. Use word hit tests and reading order so horizontal drags work in both directions and vertical drags can span lines.
+- Keep the explicit text and image controls available for ambiguous gestures, including diagonal drags that could describe either a text range or an image crop. Gesture detection can suggest an adjustable crop. **Lock selection** commits that crop and releases the full screenshot.
+- Verify tap and handle behavior, left-to-right and right-to-left text drags, vertical multiline drags, and rough rectangles even when they enclose text. Verify that short jitter and ambiguous diagonal strokes do not create a crop. Prototype with the current word bounds and verify text hit accuracy in Android Files and browser pages after OCR lands.
 
 ---
 
-### 4.3 Three-Tier Offline Text, QR & Entity Extraction Pipeline
+### 4.3 Offline Text, QR & Entity Extraction
 
-#### Tier 1: `AssistStructureParser` (Zero-Overhead Native UI Text)
+#### `AssistStructureParser` (OCR hints and fallback text)
 - Traverses `AssistStructure.WindowNode` and `AssistStructure.ViewNode` trees captured in `onHandleAssist(state: AssistState)`.
 - Computes absolute screen coordinates `(left, top, right, bottom)` for each `ViewNode` by accumulating parent offsets (`node.left + parentX - parentScrollX`).
-- Filters visible nodes (`visibility == View.VISIBLE`, `alpha > 0f`) whose bounding box intersects the user's crop `Rect` by at least 30% of the node's area.
-- Extracts `node.text` and `node.contentDescription` with word/line bounding boxes.
+- Include visible screen text from `node.text` and exclude password fields. Accessibility descriptions can label icons and whole rows and have no reliable on-screen text position.
+- Use view bounds and available line metadata to estimate word positions without shifting text origins at viewport edges. The hierarchy can supply a correct string with an approximate or displaced position. Use those estimates as a fallback when OCR is unavailable and the bounds are usable. Phone testing reported large offsets in Android Files and browser text.
 
-#### Tier 2: `EntityAndQrDetector` (Instant Offline QR & Entities)
+#### `EntityAndQrDetector` (Offline QR and entities)
 - **QR & Barcode Decoding:** Passes the cropped `Bitmap`'s `IntArray` luminance pixels to `com.google.zxing.MultiFormatReader` (configured for `QR_CODE`, `DATA_MATRIX`, `AZTEC`, `EAN_13`, `CODE_128`) on `Dispatchers.Default`. Zero native C++ code.
-- **Entity Regex / `TextClassifier`:** Scans extracted text (from Tier 1 and Tier 3) for URLs (`https?://...`), email addresses, phone numbers, and coupon/tracking codes, surfacing instant 1-tap action chips.
+- **Entity Regex / `TextClassifier`:** Scans the selected OCR or fallback text for URLs (`https?://...`), email addresses, phone numbers, and coupon/tracking codes and offers matching action chips.
 
-#### Tier 3: `OcrIsolatedService` (Sandboxed PaddleOCR v4 Mobile via ONNX Runtime)
-- Invoked automatically when Tier 1 finds no `AssistStructure` text nodes inside the crop (e.g., images, videos, canvas, games, PDFs) or when the user taps **"Force OCR"**.
+#### `OcrIsolatedService` (Primary text selection using PaddleOCR v4 Mobile)
+- Once OCR is available, run it first for on-screen text selection, including when `AssistStructure` also returns text. Return recognized words and their bounds in screenshot coordinates. Use those bounds for highlights, hit tests, and selection handles.
+- Use `AssistStructure` strings as local hints to correct likely OCR misreads when there is a unique, strong match in the same screen area. Keep the OCR bounds and preserve the visibly recognized span. Skip corrections for ambiguous matches, conflicting positions, or text extending past what is visible, such as a truncated filename. Avoid duplicate highlights.
 - **IPC Contract (`IOcrIsolatedService.aidl`):**
   ```aidl
   package com.snipsearch.ipc;
@@ -521,16 +519,19 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 - Implement `MemoryScrubber` and `FLAG_SECURE` null-screenshot handling.
 - **Verification:** Unit tests for `InvocationRouter` and memory scrubbing lifecycle (`onHide()` zeroes byte arrays and recycles bitmaps).
 
-### Milestone 3: Compose Overlay, Lasso Gesture & Tier 1/2 Offline Extraction
+### Milestone 3: Compose Overlay, Lasso Gesture & Offline Extraction Before OCR
 - Build `OverlayScreen`, `GestureLassoCanvas`, and `AdjustableCropBox` with corner resize handles.
 - Implement `AssistStructureParser` (ViewNode spatial intersection) and `EntityAndQrDetector` (ZXing QR/barcode + URL/email/phone regex).
-- Render `SelectableTextLayer` and `EntityActionChipsRow` over the cropped region.
+- Render `SelectableTextLayer` on the frozen screen and float `EntityActionChipsRow` above it. Keep lasso and crop handles in image selection.
+- Draw a glowing finger trail during text drags and image lassos. Give the adjustable crop a thick white border and larger corner touch targets.
+- **Next overlay goal:** Prototype text versus image gesture detection in §4.2. Verify geometry-dependent behavior with milestone 4.
 - **Verification:** Unit tests for `AssistStructureParser` coordinate math and `EntityAndQrDetector` QR/URL extraction.
 
 ### Milestone 4: Sandboxed PaddleOCR v4 (`android:isolatedProcess="true"`)
 - Define `IOcrIsolatedService.aidl` and `OcrTextBlockParcelable.aidl`.
 - Bundle quantized PaddleOCR v4 Mobile `.onnx` models in `src/main/assets/ocr/`.
 - Implement `OcrIsolatedService`, `PaddleOcrEngine` (Kotlin `Bitmap -> FloatBuffer` preprocessing + `OrtSession` inference + `CtcBeamDecoder`), and `OcrClientCoordinator` (`SharedMemory` + `AssetFileDescriptor` IPC).
+- Use screenshot-coordinate OCR word bounds for text selection and test hierarchy-assisted corrections against displaced bounds, repeated labels, and truncated filenames. Retest highlight alignment and text drags on a real phone in Android Files and a browser, including after scrolling.
 - **Verification:** Instrumentation/Robolectric tests verifying zero temp files created during OCR and clean recovery if the isolated service is killed.
 
 ### Milestone 5: Hybrid Visual Upload, Bottom-Sheet WebView & Multimodal Search
