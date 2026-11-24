@@ -2,6 +2,7 @@ package com.snipsearch.ui.overlay
 
 import android.app.assist.AssistStructure
 import android.graphics.Bitmap
+import android.icu.text.Bidi
 import android.graphics.Paint
 import android.graphics.Rect
 import android.view.Display
@@ -31,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -40,6 +42,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -52,6 +55,10 @@ import com.snipsearch.extraction.DetectedEntity
 import com.snipsearch.extraction.EntityAndQrDetector
 import com.snipsearch.extraction.EntityKind
 import com.snipsearch.extraction.PixelRegion
+import com.snipsearch.extraction.OcrLine
+import com.snipsearch.extraction.OcrTextCorrection
+import com.snipsearch.extraction.isolated.OcrClientCoordinator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -94,18 +101,23 @@ fun OverlayScreen(
     Box(modifier.fillMaxSize().background(Color.Black)) {
         if (source != null && originalSize != null) {
             val fullImage = PixelRegion(0, 0, originalSize.width, originalSize.height)
+            val screen = screenshotScreenBounds?.takeIf { it.width > 0 && it.height > 0 } ?: fullImage
             ImageViewport(source, originalSize, crop?.region ?: fullImage, Modifier.fillMaxSize()) { viewport ->
-                if (crop != null || imageMode) {
-                    val region = crop?.region ?: imageSelection
-                    val pixels = if (crop != null) PixelRegion(0, 0, source.width, source.height) else region
-                    val codes = if (region != null && pixels != null) rememberCodes(source, pixels, region) else null
-                    if (crop == null) {
-                        if (region == null) {
-                            Canvas(Modifier.fillMaxSize()) { drawRect(Color.Black.copy(alpha = 0.21f)) }
-                            GestureLassoCanvas(viewport, { imageSelection = it }, Modifier.fillMaxSize())
-                        } else {
-                            AdjustableCropBox(region, viewport, { imageSelection = it }, Modifier.fillMaxSize())
-                        }
+                if (crop != null) {
+                    val cropPixels = PixelRegion(0, 0, crop.region.width, crop.region.height)
+                    val codes = rememberCodes(crop.bitmap, cropPixels, crop.region)
+                    TextSelection(
+                        crop.bitmap, crop.region, assistStructures, displayId, screen, viewport,
+                        codes.orEmpty(), onDismiss,
+                    )
+                } else if (imageMode) {
+                    val region = imageSelection
+                    val codes = if (region != null) rememberCodes(source, region, region) else null
+                    if (region == null) {
+                        Canvas(Modifier.fillMaxSize()) { drawRect(Color.Black.copy(alpha = 0.21f)) }
+                        GestureLassoCanvas(viewport, { imageSelection = it }, Modifier.fillMaxSize())
+                    } else {
+                        AdjustableCropBox(region, viewport, { imageSelection = it }, Modifier.fillMaxSize())
                     }
                     OverlayCard(Modifier.align(Alignment.BottomCenter)) {
                         if (region != null) {
@@ -119,43 +131,39 @@ fun OverlayScreen(
                             OverlayMessage(R.string.overlay_select_region)
                         }
                         if (cropFailed) OverlayMessage(R.string.overlay_crop_failed)
-                        if (crop == null) {
-                            Row(
-                                Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
+                        Row(
+                            Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(onClick = {
+                                imageMode = false
+                                imageSelection = null
+                                cropFailed = false
+                            }) { Text(stringResource(R.string.overlay_text_mode)) }
+                            if (region != null) {
                                 TextButton(onClick = {
-                                    imageMode = false
                                     imageSelection = null
                                     cropFailed = false
-                                }) { Text(stringResource(R.string.overlay_text_mode)) }
-                                if (region != null) {
-                                    TextButton(onClick = {
-                                        imageSelection = null
-                                        cropFailed = false
-                                    }) { Text(stringResource(R.string.overlay_reselect)) }
-                                    Button(onClick = {
-                                        if (locked == null && !source.isRecycled) {
-                                            val bitmap = copyCrop(source, region)
-                                            if (bitmap == null) {
-                                                cropFailed = true
-                                            } else {
-                                                locked = LockedCrop(bitmap, originalSize, region)
-                                                onScreenshotConsumed()
-                                            }
+                                }) { Text(stringResource(R.string.overlay_reselect)) }
+                                Button(onClick = {
+                                    if (locked == null && !source.isRecycled) {
+                                        val bitmap = copyCrop(source, region)
+                                        if (bitmap == null) {
+                                            cropFailed = true
+                                        } else {
+                                            locked = LockedCrop(bitmap, originalSize, region)
+                                            onScreenshotConsumed()
                                         }
-                                    }) { Text(stringResource(R.string.overlay_lock_selection)) }
-                                }
+                                    }
+                                }) { Text(stringResource(R.string.overlay_lock_selection)) }
                             }
                         }
                     }
                 } else {
-                    val screen = screenshotScreenBounds?.takeIf { it.width > 0 && it.height > 0 } ?: fullImage
                     TextSelection(
-                        assistStructures, displayId, screen, viewport,
-                        onImageMode = { imageMode = true },
-                        onDismiss = onDismiss,
+                        source, fullImage, assistStructures, displayId, screen, viewport,
+                        emptyList(), onDismiss, onImageMode = { imageMode = true },
                     )
                 }
             }
@@ -171,39 +179,88 @@ fun OverlayScreen(
 
 @Composable
 private fun BoxScope.TextSelection(
-    assistStructures: List<AssistStructure>,
+    bitmap: Bitmap,
+    region: PixelRegion,
+    structures: List<AssistStructure>,
     displayId: Int,
     screen: PixelRegion,
     viewport: CropViewport,
-    onImageMode: () -> Unit,
+    codes: List<DetectedEntity>,
     onDismiss: () -> Unit,
+    onImageMode: (() -> Unit)? = null,
 ) {
-    var text by remember(assistStructures, displayId, screen) {
-        mutableStateOf<TextOptions?>(null)
+    val context = LocalContext.current.applicationContext
+    val ocr = remember(context) { OcrClientCoordinator(context) }
+    val imageBounds = viewport.imageBounds
+    val screenCrop = region.mapBetween(imageBounds, screen)
+    var assist by remember(bitmap, structures, screenCrop, displayId) {
+        mutableStateOf<List<AssistTextBlock>>(emptyList())
     }
-    LaunchedEffect(assistStructures, displayId, screen) {
-        text = withContext(Dispatchers.Default) {
-            val blocks = AssistStructureParser.extract(assistStructures, screen, displayId)
-            TextOptions(blocks, selectableWords(blocks, screen))
+    var request by remember(bitmap) { mutableIntStateOf(0) }
+    var recognized by remember(bitmap, region, request, screen, imageBounds) {
+        mutableStateOf<List<OcrLine>?>(null)
+    }
+    var failed by remember(bitmap, region, request, screen, imageBounds) { mutableStateOf(false) }
+
+    LaunchedEffect(bitmap, structures, screenCrop, displayId) {
+        assist = withContext(Dispatchers.Default) {
+            AssistStructureParser.extract(structures, screenCrop, displayId)
         }
     }
-    val options = text
-    var selection by remember(options) { mutableStateOf<IntRange?>(null) }
-    val selected = if (options == null) "" else selectedText(options.blocks, options.words, selection)
-    val entities = remember(selected) { EntityAndQrDetector.extract(selected) }
-    SelectableTextLayer(options?.words.orEmpty(), viewport, screen, selection, { selection = it }, Modifier.fillMaxSize())
-    OverlayCard(Modifier.align(Alignment.BottomCenter)) {
-        Row(
-            Modifier.fillMaxWidth().padding(start = 4.dp, end = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            val message = when {
-                options == null -> R.string.overlay_waiting_text
-                options.words.isEmpty() -> R.string.overlay_no_text
-                else -> R.string.overlay_select_text
+    LaunchedEffect(bitmap, region, request, screen, imageBounds) {
+        try {
+            recognized = ocr.recognize(bitmap).map { line ->
+                line.copy(words = line.words.map { word ->
+                    val bounds = word.bounds.translated(region.left, region.top)
+                    word.copy(bounds = bounds.mapBetween(imageBounds, screen))
+                })
             }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (_: Exception) {
+            failed = true
+            recognized = emptyList()
+        }
+    }
+
+    val lines = recognized
+    val options = remember(lines, assist, screenCrop) {
+        when {
+            lines == null -> null
+            lines.isEmpty() -> TextOptions(assist, selectableWords(assist, screenCrop))
+            else -> {
+                val corrected = OcrTextCorrection.correct(lines, assist)
+                val words = corrected.flatMapIndexed { lineIndex, line ->
+                    val bidi = Bidi(line.text, Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT)
+                    line.words.map { word ->
+                        SelectableWord(lineIndex, word.characters, word.bounds, bidi.getLevelAt(word.characters.first) % 2 != 0)
+                    }
+                }
+                TextOptions(corrected.map { AssistTextBlock(it.text, it.bounds) }, words)
+            }
+        }
+    }
+    var selection by remember(options?.words?.map { it.bounds }) { mutableStateOf<IntRange?>(null) }
+    val selected = if (options == null) "" else selectedText(options.blocks, options.words, selection)
+    val entities = remember(codes, selected) { (codes + EntityAndQrDetector.extract(selected)).distinct() }
+    if (options?.words?.isNotEmpty() == true) {
+        SelectableTextLayer(options.words, viewport, screen, selection, { selection = it }, Modifier.fillMaxSize())
+    }
+    OverlayCard(Modifier.align(Alignment.BottomCenter)) {
+        val message = when {
+            options == null -> R.string.overlay_running_ocr
+            failed && options.words.isEmpty() -> R.string.overlay_ocr_failed
+            options.words.isEmpty() -> R.string.overlay_no_text
+            else -> R.string.overlay_select_text
+        }
+        Row(Modifier.fillMaxWidth().padding(end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.weight(1f)) { SelectionActions(selected, entities, message, onDismiss) }
-            TextButton(onClick = onImageMode) { Text(stringResource(R.string.overlay_image_mode)) }
+            if (failed) {
+                TextButton(onClick = { request++ }) { Text(stringResource(R.string.overlay_ocr_retry)) }
+            }
+            if (onImageMode != null) {
+                TextButton(onClick = onImageMode) { Text(stringResource(R.string.overlay_image_mode)) }
+            }
         }
     }
 }

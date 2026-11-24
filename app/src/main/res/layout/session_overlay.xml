@@ -5,13 +5,11 @@
     android:background="#FF101214"
     android:importantForAutofill="noExcludeDescendants">
 
-    <ImageView
-        android:id="@+id/session_screenshot"
+    <androidx.compose.ui.platform.ComposeView
+        android:id="@+id/session_compose"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:contentDescription="@string/session_screenshot_description"
-        android:importantForAccessibility="no"
-        android:scaleType="fitCenter" />
+        android:visibility="gone" />
 
     <TextView
         android:id="@+id/session_title"

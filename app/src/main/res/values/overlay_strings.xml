@@ -5,9 +5,11 @@
     <string name="overlay_lock_selection">Lock selection</string>
     <string name="overlay_reselect">Start over</string>
     <string name="overlay_crop_failed">Couldn’t crop this screenshot</string>
-    <string name="overlay_waiting_text">Looking for text…</string>
     <string name="overlay_select_text">Tap a word or drag to select text</string>
     <string name="overlay_no_text">No selectable text found</string>
+    <string name="overlay_running_ocr">Reading text from the image…</string>
+    <string name="overlay_ocr_failed">Couldn’t read text from the image</string>
+    <string name="overlay_ocr_retry">Retry OCR</string>
     <string name="overlay_scanning_codes">Looking for QR codes and barcodes…</string>
     <string name="overlay_no_codes">No codes in this area</string>
     <string name="overlay_text_mode">Text</string>

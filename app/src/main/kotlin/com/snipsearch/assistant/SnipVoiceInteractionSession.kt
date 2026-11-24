@@ -1,5 +1,6 @@
 package com.snipsearch.assistant
 
+import android.app.assist.AssistStructure
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
@@ -9,11 +10,21 @@ import android.os.Handler
 import android.os.Looper
 import android.service.voice.VoiceInteractionSession
 import android.util.Log
+import android.view.Display
 import android.view.View
-import android.widget.ImageView
 import android.widget.TextView
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.platform.ComposeView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.savedstate.SavedStateRegistryController
+import androidx.savedstate.SavedStateRegistryOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.snipsearch.R
 import com.snipsearch.security.SessionMemory
+import com.snipsearch.ui.overlay.OverlayScreen
 
 /**
  * Assistant session window.
@@ -28,29 +39,40 @@ import com.snipsearch.security.SessionMemory
 class SnipVoiceInteractionSession(
     context: Context,
     private val policy: PowerButtonPolicy = PowerButtonPolicy(),
-) : VoiceInteractionSession(context) {
+) : VoiceInteractionSession(context), SavedStateRegistryOwner {
+    override val lifecycle = LifecycleRegistry(this)
+    private val stateRegistry = SavedStateRegistryController.create(this)
+    override val savedStateRegistry get() = stateRegistry.savedStateRegistry
     private val mainHandler = Handler(Looper.getMainLooper())
     private val memory = SessionMemory()
     private val controller = SessionController(
         memory = memory,
-        beforeScrub = { screenshotView?.setImageDrawable(null) },
+        beforeScrub = ::clearOverlay,
         policy = policy,
     )
     private val timeoutRunnable = Runnable { apply(controller.onCaptureTimeout(), showGeneration) }
     private val hideRunnable = Runnable { hide() }
 
-    private var screenshotView: ImageView? = null
+    private var composeView: ComposeView? = null
+    private val overlayScreenshot = mutableStateOf<Bitmap?>(null)
+    private val assistByIndex = sortedMapOf<Int, AssistStructure>()
+    private val overlayAssist = mutableStateOf<List<AssistStructure>>(emptyList())
     private var titleView: TextView? = null
     private var noticeView: TextView? = null
     private var showGeneration = 0
 
     init {
+        stateRegistry.performAttach()
+        stateRegistry.performRestore(null)
+        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         setTheme(android.R.style.Theme_DeviceDefault_NoActionBar)
     }
 
     override fun onCreateContentView(): View {
         val root = layoutInflater.inflate(R.layout.session_overlay, null)
-        screenshotView = root.findViewById(R.id.session_screenshot)
+        root.setViewTreeLifecycleOwner(this)
+        root.setViewTreeSavedStateRegistryOwner(this)
+        composeView = root.findViewById(R.id.session_compose)
         titleView = root.findViewById(R.id.session_title)
         noticeView = root.findViewById(R.id.session_notice)
         return root
@@ -68,6 +90,7 @@ class SnipVoiceInteractionSession(
 
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
+        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
         val generation = ++showGeneration
         val invocationType = InvocationRouter.invocationTypeOf(args)
         val screenshotRequested = (showFlags and SHOW_WITH_SCREENSHOT) != 0
@@ -77,15 +100,22 @@ class SnipVoiceInteractionSession(
 
     override fun onHandleScreenshot(screenshot: Bitmap?) {
         Log.i(TAG, "onHandleScreenshot present=${screenshot != null}")
+        if (screenshot == null) clearAssist()
         apply(controller.onScreenshot(screenshot), showGeneration)
     }
 
     override fun onHandleAssist(state: AssistState) {
-        val blocked = AssistStructures.isBlocked(state.assistStructure)
+        val structure = state.assistStructure
+        val blocked = AssistStructures.isBlocked(structure)
         if (blocked) {
             Log.i(TAG, "assist structure root is blocked")
+            clearAssist()
         }
         apply(controller.onAssistBlocked(blocked), showGeneration)
+        if (structure != null && controller.acceptsAssist) {
+            assistByIndex[state.index] = structure
+            overlayAssist.value = assistByIndex.values.toList()
+        }
     }
 
     override fun onHide() {
@@ -94,6 +124,7 @@ class SnipVoiceInteractionSession(
         mainHandler.removeCallbacks(hideRunnable)
         controller.onHide()
         clearViews()
+        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
         super.onHide()
     }
 
@@ -102,6 +133,7 @@ class SnipVoiceInteractionSession(
         mainHandler.removeCallbacksAndMessages(null)
         controller.onDestroy()
         clearViews()
+        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         super.onDestroy()
     }
 
@@ -139,12 +171,14 @@ class SnipVoiceInteractionSession(
             mainHandler.postDelayed(hideRunnable, effect.hideAfterMs)
         }
         if (effect.hideImmediately) {
+            clearAssist()
             mainHandler.removeCallbacks(hideRunnable)
             hide()
         }
     }
 
     private fun showWaiting() {
+        clearOverlay()
         noticeView?.visibility = View.GONE
         titleView?.visibility = View.VISIBLE
     }
@@ -154,12 +188,28 @@ class SnipVoiceInteractionSession(
         titleView?.visibility = View.GONE
         val screenshot = memory.screenshot
         if (screenshot != null && !screenshot.isRecycled) {
-            screenshotView?.setImageBitmap(screenshot)
+            val view = composeView ?: return
+            overlayScreenshot.value = screenshot
+            view.visibility = View.VISIBLE
+            view.setContent {
+                MaterialTheme {
+                    OverlayScreen(
+                        screenshot = overlayScreenshot.value,
+                        assistStructures = overlayAssist.value,
+                        onScreenshotConsumed = {
+                            overlayScreenshot.value = null
+                            memory.scrub()
+                        },
+                        onDismiss = ::hide,
+                        displayId = view.display?.displayId ?: Display.DEFAULT_DISPLAY,
+                    )
+                }
+            }
         }
     }
 
     private fun showNotice(message: Int) {
-        screenshotView?.setImageDrawable(null)
+        clearAssist()
         titleView?.visibility = View.GONE
         noticeView?.setText(message)
         noticeView?.visibility = View.VISIBLE
@@ -181,9 +231,22 @@ class SnipVoiceInteractionSession(
     }
 
     private fun clearViews() {
-        screenshotView?.setImageDrawable(null)
+        clearAssist()
         noticeView?.visibility = View.GONE
         titleView?.visibility = View.GONE
+    }
+
+    private fun clearOverlay() {
+        composeView?.let {
+            it.visibility = View.GONE
+            it.disposeComposition()
+        }
+        overlayScreenshot.value = null
+    }
+
+    private fun clearAssist() {
+        assistByIndex.clear()
+        overlayAssist.value = emptyList()
     }
 
     companion object {
