@@ -4,6 +4,7 @@ kotlin = "2.4.21"
 composeBom = "2026.09.00"
 activityCompose = "1.13.0"
 zxing = "3.5.3"
+onnxruntime = "1.26.0"
 junit = "4.13.2"
 robolectric = "4.18.1"
 # API 36 jar that Robolectric 4.18.1 loads for sdk=36 (BAKLAVA, 16-robolectric-13921718-2-i7).
@@ -14,6 +15,7 @@ androidx-activity-compose = { group = "androidx.activity", name = "activity-comp
 androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
+onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
 robolectric-android-all-instrumented = { group = "org.robolectric", name = "android-all-instrumented", version.ref = "robolectricAndroidAll" }
