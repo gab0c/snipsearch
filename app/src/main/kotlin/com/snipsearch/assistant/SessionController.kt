@@ -55,6 +55,8 @@ class SessionController(
     private var captureRequested = false
     private var refusalAt: Long? = null
 
+    val acceptsAssist: Boolean get() = accepting && !closed && !terminal && !secure
+
     fun onScreenshot(bitmap: Bitmap?): Effect {
         if (closed || !accepting || terminal) {
             MemoryScrubber.recycle(bitmap)

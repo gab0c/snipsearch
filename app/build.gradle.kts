@@ -22,6 +22,7 @@ android {
 
     buildFeatures {
         compose = true
+        aidl = true
     }
 
     // ONNX models must stay uncompressed for zero-copy AssetFileDescriptor IPC to the isolated OCR process.
@@ -82,6 +83,8 @@ android {
 
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     maxHeapSize = "2g"
+    // Robolectric's SharedMemory shadow uses the JDK file-descriptor accessor.
+    jvmArgs("--add-exports=java.base/jdk.internal.access=ALL-UNNAMED")
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {
@@ -95,6 +98,7 @@ dependencies {
     implementation(libs.androidx.compose.material3)
 
     implementation(libs.zxing.core)
+    implementation(libs.onnxruntime.android)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.robolectric.android.all.instrumented)
