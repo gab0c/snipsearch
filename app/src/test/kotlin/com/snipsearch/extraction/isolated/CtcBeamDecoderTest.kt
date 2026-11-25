@@ -13,12 +13,32 @@ class CtcBeamDecoderTest {
         val scores = FloatBuffer.wrap(FloatArray(path.size * 4) { index ->
             if (path[index / 4] == index % 4) 0.97f else 0.01f
         })
+        scores.position(3)
 
         assertEquals(listOf(DecodedWord("aa", 1, 5), DecodedWord("b", 7, 9)), decoder.decode(scores, path.size))
+        assertEquals(3, scores.position())
     }
 
     @Test
     fun blankOnlyProducesNoWords() {
         assertEquals(emptyList<DecodedWord>(), decoder.decode(FloatBuffer.wrap(floatArrayOf(1f, 0f, 0f, 0f)), 1))
+    }
+
+    @Test
+    fun handlesLowConfidenceTieBreakAndConsecutiveSpacesWithoutEarlyExit() {
+        val data = floatArrayOf(
+            0.22f, 0.34f, 0.22f, 0.22f, // token 1 ("a")
+            0.20f, 0.20f, 0.20f, 0.40f, // token 3 (" ")
+            0.20f, 0.20f, 0.20f, 0.40f, // repeated space
+            0.20f, 0.20f, 0.40f, 0.20f, // token 2 ("b")
+            0.55f, 0.15f, 0.15f, 0.15f, // blank > 0.5 early exit
+            0.20f, 0.20f, 0.40f, 0.20f, // token 2 ("b")
+        )
+        val scores = FloatBuffer.wrap(data)
+
+        assertEquals(
+            listOf(DecodedWord("a", 0, 1), DecodedWord("bb", 3, 6)),
+            decoder.decode(scores, 6),
+        )
     }
 }

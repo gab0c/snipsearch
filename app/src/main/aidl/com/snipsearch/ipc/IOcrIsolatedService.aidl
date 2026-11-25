@@ -9,5 +9,8 @@ interface IOcrIsolatedService {
                           in AssetFileDescriptor dictionary);
 
     // Native-endian ARGB ints. Stride is in pixels. Result boxes are relative to the crop.
-    List<OcrTextBlockParcelable> recognizeCrop(in SharedMemory argbPixels, int width, int height, int stride);
+    List<OcrTextBlockParcelable> recognizeCrop(long requestId, in SharedMemory argbPixels,
+                                               int width, int height, int stride);
+
+    oneway void cancelRecognition(long requestId);
 }

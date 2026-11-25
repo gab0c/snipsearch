@@ -7,9 +7,11 @@ import android.os.SharedMemory
 import com.snipsearch.ipc.IOcrIsolatedService
 import com.snipsearch.ipc.OcrTextBlockParcelable
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicLong
 
 class OcrIsolatedService : Service() {
     private val engineLock = Any()
+    private val cancelledUpTo = AtomicLong(0L)
     private var engine: PaddleOcrEngine? = null
 
     private val binder = object : IOcrIsolatedService.Stub() {
@@ -30,22 +32,31 @@ class OcrIsolatedService : Service() {
         }
 
         override fun recognizeCrop(
+            requestId: Long,
             argbPixels: SharedMemory,
             width: Int,
             height: Int,
             stride: Int,
         ): List<OcrTextBlockParcelable> = argbPixels.use { shared ->
+            if (requestId <= cancelledUpTo.get()) return emptyList()
             runOcr {
+                if (requestId <= cancelledUpTo.get()) return@runOcr emptyList()
                 require(shared.size == pixelBufferSize(width, height, stride))
                 val ocr = checkNotNull(engine)
                 val mapping = shared.mapReadOnly()
                 try {
                     val pixels = mapping.order(ByteOrder.nativeOrder()).asIntBuffer()
-                    ocr.recognize(pixels, width, height, stride)
+                    ocr.recognize(pixels, width, height, stride) {
+                        requestId <= cancelledUpTo.get()
+                    }
                 } finally {
                     SharedMemory.unmap(mapping)
                 }
             }
+        }
+
+        override fun cancelRecognition(requestId: Long) {
+            cancelledUpTo.accumulateAndGet(requestId, ::maxOf)
         }
     }
 
