@@ -9,6 +9,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.IntBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.roundToInt
@@ -18,21 +23,30 @@ internal class PaddleOcrEngine private constructor(
     private val detector: OrtSession,
     private val recognizer: OrtSession,
     private val decoder: CtcBeamDecoder,
+    private val recWorkers: Int,
+    private val recExecutor: ExecutorService,
 ) : AutoCloseable {
-    fun recognize(argb: IntBuffer, width: Int, height: Int, stride: Int): List<OcrTextBlockParcelable> {
+    fun recognize(
+        argb: IntBuffer,
+        width: Int,
+        height: Int,
+        stride: Int,
+        isCancelled: () -> Boolean = { false },
+    ): List<OcrTextBlockParcelable> {
+        if (isCancelled()) return emptyList()
         val scale = minOf(1.0, 960.0 / maxOf(width, height))
         val detWidth = ((width * scale / 32).roundToInt()).coerceAtLeast(1) * 32
         val detHeight = ((height * scale / 32).roundToInt()).coerceAtLeast(1) * 32
         val scaleX = width.toDouble() / detWidth
         val scaleY = height.toDouble() / detHeight
-        val image = CropImage(argb, width, height, stride)
 
+        val detImage = CropImage(argb.duplicate(), width, height, stride)
         val regions = infer(
             detector, detWidth, detHeight,
             fill = { input ->
                 for (y in 0 until detHeight) {
                     for (x in 0 until detWidth) {
-                        image.sample(
+                        detImage.sample(
                             input, y * detWidth + x, detWidth * detHeight,
                             (x + 0.5) * scaleX, (y + 0.5) * scaleY, DET_MEAN, DET_STD,
                         )
@@ -43,8 +57,44 @@ internal class PaddleOcrEngine private constructor(
             require(shape.contentEquals(longArrayOf(1, 1, detHeight.toLong(), detWidth.toLong())))
             TextDetector.regions(output, detWidth, detHeight)
         }
+        if (regions.isEmpty() || isCancelled()) return emptyList()
 
-        return regions.mapNotNull { recognizeLine(image, it, scaleX, scaleY) }
+        val results = arrayOfNulls<OcrTextBlockParcelable>(regions.size)
+        if (regions.size == 1 || recWorkers <= 1) {
+            for ((index, region) in regions.withIndex()) {
+                if (isCancelled()) break
+                results[index] = recognizeLine(detImage, region, scaleX, scaleY)
+            }
+        } else {
+            // Longest-first scheduling keeps wide lines from forming a serial tail.
+            val order = regions.indices
+                .sortedByDescending { regions[it].aspectRatio(scaleX, scaleY) }
+                .toIntArray()
+            val nextTask = AtomicInteger(0)
+            val failure = AtomicReference<Throwable?>(null)
+            val workerCount = minOf(recWorkers, regions.size)
+            val done = CountDownLatch(workerCount)
+            repeat(workerCount) {
+                recExecutor.execute {
+                    val workerImage = CropImage(argb.duplicate(), width, height, stride)
+                    try {
+                        while (!isCancelled() && failure.get() == null) {
+                            val orderIdx = nextTask.getAndIncrement()
+                            if (orderIdx >= order.size) break
+                            val regionIdx = order[orderIdx]
+                            results[regionIdx] = recognizeLine(workerImage, regions[regionIdx], scaleX, scaleY)
+                        }
+                    } catch (t: Throwable) {
+                        failure.compareAndSet(null, t)
+                    } finally {
+                        done.countDown()
+                    }
+                }
+            }
+            done.await()
+            failure.get()?.let { throw it }
+        }
+        return if (isCancelled()) emptyList() else results.filterNotNull()
     }
 
     private fun recognizeLine(
@@ -52,7 +102,7 @@ internal class PaddleOcrEngine private constructor(
     ): OcrTextBlockParcelable? {
         val height = 48
         val contentWidth = ceil(height * region.aspectRatio(scaleX, scaleY)).toInt().coerceIn(16, 960)
-        val width = maxOf(320, ((contentWidth + 7) / 8) * 8)
+        val width = (((contentWidth + 31) / 32) * 32).coerceAtLeast(32)
         return infer(
             recognizer, width, height,
             fill = { input ->
@@ -132,6 +182,7 @@ internal class PaddleOcrEngine private constructor(
     }
 
     override fun close() {
+        recExecutor.shutdownNow()
         try {
             recognizer.close()
         } finally {
@@ -153,17 +204,67 @@ internal class PaddleOcrEngine private constructor(
             require(alphabet.size == 6623)
             val environment = OrtEnvironment.getEnvironment()
             environment.setTelemetry(false)
-            return OrtSession.SessionOptions().use { options ->
-                options.setIntraOpNumThreads(2)
-                options.setCPUArenaAllocator(false)
-                val det = environment.createSession(detector.modelBytes(), options)
-                try {
-                    val rec = environment.createSession(recognizer.modelBytes(), options)
-                    PaddleOcrEngine(environment, det, rec, CtcBeamDecoder(alphabet + " "))
-                } catch (failure: Exception) {
-                    det.close()
-                    throw failure
+            val workers = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            val det = openSession(environment, detector.modelBytes(), intraThreads = workers)
+            return try {
+                val rec = openSession(environment, recognizer.modelBytes(), intraThreads = 1)
+                val recExecutor = Executors.newFixedThreadPool(workers) { runnable ->
+                    Thread(runnable, "snip-ocr-rec").apply { isDaemon = true }
                 }
+                PaddleOcrEngine(environment, det, rec, CtcBeamDecoder(alphabet + " "), workers, recExecutor)
+            } catch (failure: Exception) {
+                det.close()
+                throw failure
+            }
+        }
+
+        private fun openSession(
+            environment: OrtEnvironment,
+            modelBytes: ByteArray,
+            intraThreads: Int,
+        ): OrtSession {
+            val xnnpackAttempt = createSessionOptions(intraThreads, useXnnpack = true)
+            if (xnnpackAttempt.second) {
+                try {
+                    return xnnpackAttempt.first.use { options ->
+                        environment.createSession(modelBytes, options)
+                    }
+                } catch (_: Exception) {
+                    // Fall back cleanly to default CPU EP if XNNPACK rejects any graph node.
+                }
+            } else {
+                xnnpackAttempt.first.close()
+            }
+            return createSessionOptions(intraThreads, useXnnpack = false).first.use { options ->
+                environment.createSession(modelBytes, options)
+            }
+        }
+
+        private fun createSessionOptions(
+            intraThreads: Int,
+            useXnnpack: Boolean,
+        ): Pair<OrtSession.SessionOptions, Boolean> {
+            val options = OrtSession.SessionOptions()
+            try {
+                options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                options.setCPUArenaAllocator(true)
+                options.setInterOpNumThreads(1)
+                options.addConfigEntry("session.intra_op.allow_spinning", "0")
+                options.setIntraOpNumThreads(intraThreads)
+                val xnnpackActive = if (useXnnpack) {
+                    try {
+                        options.addXnnpack(mapOf("intra_op_num_threads" to intraThreads.toString()))
+                        true
+                    } catch (_: Throwable) {
+                        false
+                    }
+                } else {
+                    false
+                }
+                return options to xnnpackActive
+            } catch (failure: Throwable) {
+                options.close()
+                throw failure
             }
         }
 
