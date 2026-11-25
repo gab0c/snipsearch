@@ -3,8 +3,9 @@ Copyright (c) PaddlePaddle Authors. Licensed under the Apache License, Version 2
 (https://www.apache.org/licenses/LICENSE-2.0).
 
 SnipSearch converted the detector and recognizer weights to per-output-channel
-INT8 storage (dequantized for execution) and replaced the recognizer's trailing
-Softmax with INT64 ArgMax for single-pass greedy CTC decoding. Upstream ONNX
+INT8 storage (dequantized for execution). The recognizer exports compact INT64
+ArgMax token IDs and FLOAT maximum probabilities per time step; Softmax stays
+internal to the graph, with no full character tensor copied to Kotlin. Upstream ONNX
 exports and inference configurations come from the official PaddlePaddle
 repositories on Hugging Face.
 

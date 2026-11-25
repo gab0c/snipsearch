@@ -14,8 +14,8 @@ import kotlin.math.sin
  * and expands each rectangle to recover the edges of the text line.
  */
 internal object TextDetector {
-    private const val PIXEL_THRESH = 0.20f
-    private const val REGION_SCORE_THRESH = 0.40
+    private const val PIXEL_THRESH = 0.30f
+    private const val REGION_SCORE_THRESH = 0.65
     private const val UNCLIP_RATIO = 1.4
 
     fun regions(map: FloatBuffer, width: Int, height: Int): List<TextRegion> {
@@ -82,6 +82,9 @@ internal object TextDetector {
                 val w = right - left + 1
                 val h = bottom - top + 1
                 if (minOf(w, h) < 3) continue
+                // UI icons activate strongly in v6. Preserve confident square characters,
+                // but require stronger evidence for compact components than for text lines.
+                if (maxOf(w, h) / minOf(w, h) <= 1.6 && total / tail < 0.95) continue
                 val pad = 0.5 + UNCLIP_RATIO * w * h / (2 * (w + h))
                 regions += TextRegion(left - pad, top - pad, right + pad, bottom + pad, dx, dy)
             }

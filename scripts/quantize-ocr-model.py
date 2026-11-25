@@ -163,6 +163,14 @@ def make_int_attr(name: str, value: int) -> bytes:
     )
 
 
+def make_ints_attr(name: str, values: list[int]) -> bytes:
+    return (
+        encode_field_bytes(1, name.encode("utf-8"))
+        + encode_field_bytes(8, b"".join(encode_varint(v) for v in values))
+        + encode_field_varint(20, 7)  # AttributeProto.INTS
+    )
+
+
 def make_node(op_type: str, inputs: list[str], outputs: list[str], attrs: list[bytes], name: str = "") -> bytes:
     parts = [encode_field_bytes(1, item.encode("utf-8")) for item in inputs]
     parts.extend(encode_field_bytes(2, item.encode("utf-8")) for item in outputs)
@@ -217,7 +225,7 @@ def attr_name_and_info(attr_bytes: bytes) -> tuple[str, int | None, list[int], b
     return name, i_val, ints_val, t_val
 
 
-def rewrite_value_info_to_argmax(vi_bytes: bytes, drop_axis: int) -> bytes:
+def rewrite_value_info_to_argmax(vi_bytes: bytes, drop_axis: int, element_type: int = TENSOR_INT64) -> bytes:
     out_parts = []
     for f, w, v, raw in parse_fields(vi_bytes):
         if f != 2 or w != 2:
@@ -233,7 +241,7 @@ def rewrite_value_info_to_argmax(vi_bytes: bytes, drop_axis: int) -> bytes:
             tensor_type_parts = []
             for ttf, ttw, ttv, ttraw in parse_fields(tv):
                 if ttf == 1 and ttw == 0:
-                    tensor_type_parts.append(encode_field_varint(1, TENSOR_INT64))
+                    tensor_type_parts.append(encode_field_varint(1, element_type))
                 elif ttf == 2 and ttw == 2:
                     assert isinstance(ttv, bytes)
                     dims_raw = [sraw for sf, sw, sv, sraw in parse_fields(ttv) if sf == 1]
@@ -433,7 +441,7 @@ def transform_model(
                 new_inits.append(ib)
         initializers = new_inits
 
-    # Step B: Replace trailing Softmax with ArgMax(axis, keepdims=0).
+    # Step B: Keep Softmax internal; emit compact per-step max probability and token IDs.
     if replace_softmax_with_argmax:
         output_names = {
             next(vv.decode("utf-8") for vf, vw, vv, _ in parse_fields(o) if vf == 1)
@@ -441,6 +449,7 @@ def transform_model(
         }
         rewritten_nodes = []
         replaced_axes: dict[str, int] = {}
+        reduce_axes_initializers: list[bytes] = []
         for nb in nodes:
             name, op, ins, outs, attrs = decode_node(nb)
             if op == "Softmax" and len(outs) == 1 and outs[0] in output_names:
@@ -449,26 +458,58 @@ def transform_model(
                     an, ai, _, _ = attr_name_and_info(ab)
                     if an == "axis" and ai is not None:
                         axis = ai
+                token_output = outs[0] + "_argmax_tokens"
+                confidence_output = outs[0] + "_max_probability"
                 replaced_axes[outs[0]] = axis
-                rewritten_nodes.append(
-                    make_node(
-                        "ArgMax",
-                        ins,
-                        outs,
-                        [make_int_attr("axis", axis), make_int_attr("keepdims", 0)],
-                        name=name.replace("Softmax", "ArgMax") if name else "",
+                rewritten_nodes.append(nb)
+                rewritten_nodes.append(make_node(
+                    "ArgMax", ins, [token_output],
+                    [make_int_attr("axis", axis), make_int_attr("keepdims", 0)],
+                    name=name.replace("Softmax", "ArgMax") if name else "",
+                ))
+                if current_opset >= 18:
+                    axes_name = f"__confidence_axes_{len(reduce_axes_initializers)}"
+                    reduce_axes_initializers.append(
+                        encode_tensor(axes_name, [1], TENSOR_INT64, pack_int64_le([axis]))
                     )
-                )
+                    reduce_max_inputs = [outs[0], axes_name]
+                    reduce_attrs = [make_int_attr("keepdims", 0)]
+                else:
+                    reduce_max_inputs = [outs[0]]
+                    reduce_attrs = [make_int_attr("keepdims", 0), make_ints_attr("axes", [axis])]
+                rewritten_nodes.append(make_node(
+                    "ReduceMax", reduce_max_inputs, [confidence_output], reduce_attrs,
+                    name=name.replace("Softmax", "Confidence") if name else "",
+                ))
             else:
                 rewritten_nodes.append(nb)
         if not replaced_axes:
             raise ValueError("No output Softmax node found to replace with ArgMax")
         nodes = rewritten_nodes
+        initializers.extend(reduce_axes_initializers)
         new_outputs = []
         for ob in outputs:
             oname = next(vv.decode("utf-8") for vf, vw, vv, _ in parse_fields(ob) if vf == 1)
             if oname in replaced_axes:
-                new_outputs.append(rewrite_value_info_to_argmax(ob, replaced_axes[oname]))
+                # Original output name now carries compact confidence [1,T].
+                confidence_ob = rewrite_value_info_to_argmax(ob, replaced_axes[oname], TENSOR_FLOAT)
+                confidence_ob = b"".join(
+                    encode_field_bytes(1, (oname + "_max_probability").encode("utf-8"))
+                    if f == 1 and w == 2 else raw
+                    for f, w, v, raw in parse_fields(confidence_ob)
+                )
+                new_outputs.append(confidence_ob)
+                token_name = oname + "_argmax_tokens"
+                token_info = []
+                for f, w, v, raw in parse_fields(ob):
+                    if f != 1 or w != 2:
+                        token_info.append(raw)
+                    else:
+                        token_info.append(encode_field_bytes(1, token_name.encode("utf-8")))
+                # Retarget type shape/type from Softmax [1,T,C] float to ArgMax [1,T] int64.
+                token_ob = b"".join(token_info)
+                token_ob = rewrite_value_info_to_argmax(token_ob, replaced_axes[oname])
+                new_outputs.append(token_ob)
             else:
                 new_outputs.append(ob)
         outputs = new_outputs
@@ -649,7 +690,7 @@ def main() -> None:
     parser.add_argument(
         "--replace-softmax-with-argmax",
         action="store_true",
-        help="Replace output Softmax with INT64 ArgMax(keepdims=0) for greedy CTC decoding.",
+        help="Emit INT64 ArgMax tokens and compact per-step max-Softmax confidence for greedy CTC decoding.",
     )
     parser.add_argument(
         "--prune-non-cjk",

@@ -54,4 +54,34 @@ class TextDetectorTest {
 
         assertEquals(emptyList<TextRegion>(), TextDetector.regions(map, width, height))
     }
+    @Test
+    fun rejectsWeakIconSizedComponentsButPreservesConfidentSquareCharacters() {
+        for ((score, expected) in listOf(.45f to 0, .90f to 0, .98f to 1)) {
+            val map = FloatBuffer.allocate(32 * 32)
+            for (y in 8 until 16) for (x in 8 until 16) map.put(y * 32 + x, score)
+            assertEquals(expected, TextDetector.regions(map, 32, 32).size)
+        }
+    }
+
+    @Test
+    fun preservesDenseSeparateLinesShortLabelsAndAngledText() {
+        val map = FloatBuffer.allocate(96 * 96)
+        // Dense paragraph/URL-like lines and a short label must stay distinct.
+        for (y in 8 until 12) for (x in 4 until 88) map.put(y * 96 + x, .85f)
+        for (y in 18 until 22) for (x in 4 until 88) map.put(y * 96 + x, .85f)
+        for (y in 30 until 35) for (x in 4 until 14) map.put(y * 96 + x, .85f)
+        // An oblique strip checks orientation-independent component fitting.
+        for (x in 20 until 65) for (dy in 0 until 5) map.put((x / 2 + 45 + dy) * 96 + x, .9f)
+        val regions = TextDetector.regions(map, 96, 96)
+        assertEquals(4, regions.size)
+        assertTrue(regions.any { kotlin.math.abs(it.dy) > .2 })
+    }
+
+    @Test
+    fun retainsSmallConfidentTextAtMinimumUsableSize() {
+        val map = FloatBuffer.allocate(16 * 16)
+        for (y in 4 until 7) for (x in 4 until 7) map.put(y * 16 + x, .98f)
+        assertEquals(1, TextDetector.regions(map, 16, 16).size)
+    }
+
 }

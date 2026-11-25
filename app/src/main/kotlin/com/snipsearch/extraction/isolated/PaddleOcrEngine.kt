@@ -11,7 +11,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.IntBuffer
-import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -55,9 +54,9 @@ internal class PaddleOcrEngine private constructor(
             fill = { planar ->
                 fillDetectorInput(argb, width, height, stride, detWidth, detHeight, scaleX, scaleY, planar)
             },
-        ) { shape, output ->
+        ) { shape, output, _ ->
             require(shape.contentEquals(longArrayOf(1, 1, detHeight.toLong(), detWidth.toLong())))
-            TextDetector.regions(output.floatBuffer, detWidth, detHeight)
+            TextDetector.regions(output.floatBuffer!!, detWidth, detHeight)
         }
         val detMs = (System.nanoTime() - detStartNanos) / 1_000_000L
         onDetected(regions.size, detMs)
@@ -240,18 +239,18 @@ internal class PaddleOcrEngine private constructor(
                     }
                 }
             },
-        ) { shape, output ->
+        ) { shape, output, tokenOutput ->
             val steps = shape[1].toInt()
-            val words = when {
-                shape.size == 2 && shape[0] == 1L && output.info.type == OnnxJavaType.INT64 -> {
-                    decoder.decodeTokens(output.longBuffer, steps)
-                }
-                shape.size == 3 && shape[0] == 1L &&
-                    shape[2] == decoder.classes.toLong() && output.info.type == OnnxJavaType.FLOAT -> {
-                    decoder.decode(output.floatBuffer, steps)
-                }
-                else -> error("Unexpected recognizer output ${output.info.type} ${shape.contentToString()}")
-            }
+            require(shape.contentEquals(longArrayOf(1, steps.toLong())) && output.type == OnnxJavaType.FLOAT)
+            val ids = tokenOutput ?: error("Recognizer token output is missing")
+            val tokenIds = ids.longBuffer ?: error("Recognizer token output has no INT64 buffer")
+            val maxProbabilities = output.floatBuffer ?: error("Recognizer confidence output has no FLOAT buffer")
+            require(ids.type == OnnxJavaType.INT64 && tokenIds.capacity() == steps)
+            require(maxProbabilities.capacity() == steps)
+            val decodedWords = decoder.decodeTokensWithConfidence(tokenIds, maxProbabilities, steps)
+            val words = filterRecognizedWords(
+                decodedWords, width.toDouble() / (contentWidth * steps) * region.aspectRatio(scaleX, scaleY),
+            )
             if (words.isEmpty()) return@infer null
             val starts = IntArray(words.size)
             val ends = IntArray(words.size)
@@ -375,7 +374,7 @@ internal class PaddleOcrEngine private constructor(
         width: Int,
         height: Int,
         fill: (FloatArray) -> Unit,
-        read: (LongArray, OnnxTensor) -> T,
+        read: (LongArray, InferenceOutput, InferenceOutput?) -> T,
     ): T {
         val floatCount = 3 * width * height
         val planar = scratch.planarArray(floatCount)
@@ -388,10 +387,11 @@ internal class PaddleOcrEngine private constructor(
             OnnxTensor.createTensor(environment, input, shape).use { tensor ->
                 session.run(mapOf(session.inputNames.single() to tensor)).use { result ->
                     val output = result[0] as OnnxTensor
-                    try {
-                        return read(output.info.shape, output)
-                    } finally {
-                        scrubTensor(output)
+                    val auxiliary = if (result.size() > 1) result[1] as OnnxTensor else null
+                    inferenceOutput(output).use { outputData ->
+                        auxiliary?.let(::inferenceOutput).use { auxiliaryData ->
+                            return read(output.info.shape, outputData, auxiliaryData)
+                        }
                     }
                 }
             }
@@ -400,13 +400,11 @@ internal class PaddleOcrEngine private constructor(
         }
     }
 
-    private fun scrubTensor(output: OnnxTensor) {
-        when (output.info.type) {
-            OnnxJavaType.INT64 -> output.longBuffer?.let { zeroLongBuffer(it) }
-            OnnxJavaType.FLOAT -> output.floatBuffer?.let { zeroFloatBuffer(it) }
-            else -> Unit
-        }
-    }
+    private fun inferenceOutput(tensor: OnnxTensor) = InferenceOutput(
+        type = tensor.info.type,
+        floatBuffer = if (tensor.info.type == OnnxJavaType.FLOAT) tensor.floatBuffer else null,
+        longBuffer = if (tensor.info.type == OnnxJavaType.INT64) tensor.longBuffer else null,
+    )
 
     override fun close() {
         recExecutor.shutdownNow()
@@ -452,7 +450,7 @@ internal class PaddleOcrEngine private constructor(
             buffer.clear()
         }
 
-        private fun zeroLongBuffer(buffer: java.nio.LongBuffer, count: Int = buffer.capacity()) {
+        internal fun zeroLongBuffer(buffer: java.nio.LongBuffer, count: Int = buffer.capacity()) {
             val target = minOf(count, buffer.capacity())
             buffer.clear()
             var offset = 0
@@ -482,14 +480,11 @@ internal class PaddleOcrEngine private constructor(
             var detSession: OrtSession? = null
             val recSessions = mutableListOf<OrtSession>()
             try {
-                val recFutures = (0 until workers).map {
-                    recExecutor.submit(Callable { openSession(environment, recBytes, intraThreads = 1) })
-                }
                 val (openedDet, detXnnpack) = openSession(environment, detBytes, intraThreads = workers)
                 detSession = openedDet
                 var recXnnpack = true
-                for (future in recFutures) {
-                    val (openedRec, active) = future.get()
+                repeat(workers) {
+                    val (openedRec, active) = openSession(environment, recBytes, intraThreads = 1)
                     recSessions += openedRec
                     recXnnpack = recXnnpack && active
                 }
@@ -575,7 +570,18 @@ internal class PaddleOcrEngine private constructor(
     }
 }
 
-private class DirectFloatScratch {
+internal data class InferenceOutput(
+    val type: OnnxJavaType,
+    val floatBuffer: FloatBuffer?,
+    val longBuffer: java.nio.LongBuffer?,
+) : AutoCloseable {
+    override fun close() {
+        floatBuffer?.let { PaddleOcrEngine.zeroFloatBuffer(it) }
+        longBuffer?.let { PaddleOcrEngine.zeroLongBuffer(it) }
+    }
+}
+
+internal class DirectFloatScratch {
     private var floatBuffer: FloatBuffer? = null
     private var planar: FloatArray = FloatArray(0)
 

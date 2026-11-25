@@ -24,7 +24,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
    - If the user revokes the **GrapheneOS Network toggle** (removing `AID_INET` / `GID 3003`), the app MUST NOT crash. It must detect offline state via `ConnectivityManager` / `SocketException`, disable the embedded `WebView` and remote image uploads, and degrade gracefully to offline text/QR extraction (`AssistStructure` + `PaddleOCR` + `ZXing`) and external browser `Intent.ACTION_VIEW` handoff.
 4. **Isolated Process On-Device OCR (`android:isolatedProcess="true"`):**
    - Primary text extraction uses `AssistStructure.ViewNode` bounds intersection (zero ML overhead).
-   - Pixel-baked text extraction runs **PaddleOCR v4 Mobile** (`det` + `rec` `.onnx` models bundled uncompressed in `src/main/assets/ocr/`) via `onnxruntime-android` (`>= 1.22.0`) inside an `android:isolatedProcess="true"` bound `Service` (`OcrIsolatedService`).
+   - Pixel-baked text extraction runs **PP-OCRv6 Tiny** (`det` + `rec` `.onnx` models bundled uncompressed in `src/main/assets/ocr/`) via `onnxruntime-android` (`>= 1.22.0`) inside an `android:isolatedProcess="true"` bound `Service` (`OcrIsolatedService`).
    - Pass cropped `Bitmap` data and `.onnx` model descriptors across the Binder boundary using `SharedMemory` (`ashmem` / `ParcelFileDescriptor`) and `AssetFileDescriptor`.
 
 ---
