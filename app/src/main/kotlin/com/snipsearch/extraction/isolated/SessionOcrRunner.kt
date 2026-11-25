@@ -2,6 +2,7 @@ package com.snipsearch.extraction.isolated
 
 import android.graphics.Bitmap
 import com.snipsearch.extraction.OcrLine
+import com.snipsearch.extraction.OcrTiming
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -21,6 +22,8 @@ internal data class OcrScanSnapshot(
     val scanId: Long = 0L,
     val status: Status = Status.IDLE,
     val lines: List<OcrLine> = emptyList(),
+    val detectedRegionCount: Int? = null,
+    val reusedService: Boolean = false,
 ) {
     enum class Status {
         IDLE,
@@ -57,12 +60,13 @@ internal class SessionOcrRunner(
 
     fun nextScanId(): Long = nextScanIdGenerator.incrementAndGet()
 
-    fun warmUp() {
+    fun warmUp(timing: OcrTiming? = null) {
         synchronized(stateLock) {
             if (warmJob?.isActive == true) return
             warmJob = scope.launch(ioDispatcher) {
                 try {
-                    coordinator.warmUp()
+                    val ready = coordinator.warmUp()
+                    timing?.logServiceReady(ready.bindMs, ready.initMs, ready.reused)
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (_: Exception) {
@@ -72,11 +76,11 @@ internal class SessionOcrRunner(
         }
     }
 
-    fun startScan(scanId: Long, bitmap: Bitmap) {
+    fun startScan(scanId: Long, bitmap: Bitmap, timing: OcrTiming? = null) {
         val previous: ActiveScan?
         val current = ActiveScan(scanId)
         val job = scope.launch(workerDispatcher, start = CoroutineStart.LAZY) {
-            runScan(current, bitmap)
+            runScan(current, bitmap, timing)
         }
         current.job = job
         synchronized(stateLock) {
@@ -122,13 +126,20 @@ internal class SessionOcrRunner(
         scope.cancel()
     }
 
-    private suspend fun runScan(scan: ActiveScan, bitmap: Bitmap) {
+    private suspend fun runScan(scan: ActiveScan, bitmap: Bitmap, timing: OcrTiming?) {
+        val scanStartNanos = System.nanoTime()
         val pixels = try {
             synchronized(pixelCopyLock) {
                 if (scan.cancelled.get() || bitmap.isRecycled) {
                     null
                 } else {
-                    OcrClientCoordinator.CropPixels.copy(bitmap) { scan.cancelled.get() }
+                    val copyStartNanos = System.nanoTime()
+                    val copied = OcrClientCoordinator.CropPixels.copy(bitmap) { scan.cancelled.get() }
+                    if (copied != null) {
+                        val copyMs = (System.nanoTime() - copyStartNanos) / 1_000_000L
+                        timing?.logPixelsCopied(copyMs, copied.width, copied.height)
+                    }
+                    copied
                 }
             }
         } catch (cancellation: CancellationException) {
@@ -146,13 +157,28 @@ internal class SessionOcrRunner(
         }
 
         pixels.use { cropPixels ->
+            var reusedService = false
             try {
-                val finalLines = coordinator.recognize(cropPixels)
+                val finalLines = coordinator.recognize(
+                    pixels = cropPixels,
+                    onReady = { info ->
+                        reusedService = info.reused
+                        timing?.logServiceReady(info.bindMs, info.initMs, info.reused)
+                    },
+                    onDetect = { count, detMs ->
+                        timing?.logDetectDone(detMs, count)
+                        publishIfCurrent(scan) { it.copy(detectedRegionCount = count) }
+                    },
+                )
                 if (!scan.cancelled.get()) {
+                    val totalOcrMs = (System.nanoTime() - scanStartNanos) / 1_000_000L
+                    val wordCount = finalLines.sumOf { it.words.size }
+                    timing?.logOcrComplete(totalOcrMs, finalLines.size, wordCount, reusedService)
                     publishIfCurrent(scan) {
                         it.copy(
                             status = OcrScanSnapshot.Status.COMPLETE,
                             lines = finalLines,
+                            reusedService = reusedService,
                         )
                     }
                 }

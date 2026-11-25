@@ -24,6 +24,7 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.snipsearch.R
+import com.snipsearch.extraction.OcrTiming
 import com.snipsearch.extraction.isolated.OcrClientCoordinator
 import com.snipsearch.extraction.isolated.SessionOcrRunner
 import com.snipsearch.security.SessionMemory
@@ -67,6 +68,7 @@ class SnipVoiceInteractionSession(
     private var noticeView: TextView? = null
     private var showGeneration = 0
     private var overlayApproved = false
+    private var currentTiming: OcrTiming? = null
 
     init {
         stateRegistry.performAttach()
@@ -87,18 +89,21 @@ class SnipVoiceInteractionSession(
 
     override fun onPrepareShow(args: Bundle?, showFlags: Int) {
         super.onPrepareShow(args, showFlags)
+        val invocationType = InvocationRouter.invocationTypeOf(args)
         val open = InvocationRouter.opensOverlay(
-            InvocationRouter.invocationTypeOf(args),
+            invocationType,
             policy.action(),
             policy.delegatedPackage(),
         )
         setUiEnabled(open)
         overlayApproved = open
         if (open) {
-            ocrRunner.warmUp()
+            val timing = currentTiming ?: OcrTiming.start(invocationType).also { currentTiming = it }
+            ocrRunner.warmUp(timing)
         } else {
             ocrRunner.cancelActiveScan()
             fullScreenScanId.longValue = 0L
+            currentTiming = null
         }
     }
 
@@ -113,8 +118,10 @@ class SnipVoiceInteractionSession(
             policy.delegatedPackage(),
         )
         overlayApproved = open
-        if (open) {
-            ocrRunner.warmUp()
+        if (open && currentTiming == null) {
+            val timing = OcrTiming.start(invocationType)
+            currentTiming = timing
+            ocrRunner.warmUp(timing)
         }
         val screenshotRequested = (showFlags and SHOW_WITH_SCREENSHOT) != 0
         Log.i(TAG, "onShow type=$invocationType screenshotRequested=$screenshotRequested")
@@ -135,10 +142,13 @@ class SnipVoiceInteractionSession(
             clearAssist()
         }
         val effect = controller.onScreenshot(screenshot)
-        if (screenshot != null && memory.screenshot === screenshot && !screenshot.isRecycled && overlayApproved) {
-            val scanId = ocrRunner.nextScanId()
-            fullScreenScanId.longValue = scanId
-            ocrRunner.startScan(scanId, screenshot)
+        if (screenshot != null && memory.screenshot === screenshot && !screenshot.isRecycled) {
+            currentTiming?.logCaptureArrived(screenshot.width, screenshot.height)
+            if (overlayApproved) {
+                val scanId = ocrRunner.nextScanId()
+                fullScreenScanId.longValue = scanId
+                ocrRunner.startScan(scanId, screenshot, currentTiming)
+            }
         }
         apply(effect, showGeneration)
     }
@@ -155,7 +165,9 @@ class SnipVoiceInteractionSession(
         apply(controller.onAssistBlocked(blocked), showGeneration)
         if (structure != null && controller.acceptsAssist) {
             assistByIndex[state.index] = structure
-            overlayAssist.value = assistByIndex.values.toList()
+            val structures = assistByIndex.values.toList()
+            overlayAssist.value = structures
+            currentTiming?.logAssistArrived(structures.size)
         }
     }
 
@@ -166,6 +178,7 @@ class SnipVoiceInteractionSession(
         controller.onHide()
         ocrRunner.onSessionHide()
         overlayApproved = false
+        currentTiming = null
         fullScreenScanId.longValue = 0L
         clearViews()
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
@@ -178,6 +191,7 @@ class SnipVoiceInteractionSession(
         controller.onDestroy()
         ocrRunner.onSessionDestroy()
         overlayApproved = false
+        currentTiming = null
         fullScreenScanId.longValue = 0L
         clearViews()
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
@@ -239,7 +253,7 @@ class SnipVoiceInteractionSession(
             if (fullScreenScanId.longValue == 0L && overlayApproved) {
                 val scanId = ocrRunner.nextScanId()
                 fullScreenScanId.longValue = scanId
-                ocrRunner.startScan(scanId, screenshot)
+                ocrRunner.startScan(scanId, screenshot, currentTiming)
             }
             overlayScreenshot.value = screenshot
             view.visibility = View.VISIBLE
@@ -258,6 +272,7 @@ class SnipVoiceInteractionSession(
                         displayId = view.display?.displayId ?: Display.DEFAULT_DISPLAY,
                         ocrRunner = ocrRunner,
                         fullScreenScanId = fullScreenScanId.longValue,
+                        timing = currentTiming,
                     )
                 }
             }

@@ -8,7 +8,7 @@
 - **Native Assistant Trigger Without Accessibility Abuse:** Uses Android's `VoiceInteractionService` (`ROLE_ASSISTANT`) to receive an on-demand screenshot (`onHandleScreenshot`) and view hierarchy (`onHandleAssist`) strictly at the moment the user invokes it—requiring **zero** `AccessibilityService`, **zero** `SYSTEM_ALERT_WINDOW`, and **zero** persistent background observation.
 - **Coexistence with Secondary Voice Assistants:** Uses AOSP `invocation_type` trigger-source routing so swiping up from a bottom corner (or long-pressing Home in 3-button navigation) opens SnipSearch while long-pressing the power button (the stock Android assistant trigger; GrapheneOS keeps the power menu there) can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
 - **Unified In-App Bottom-Sheet UX:** Mounts a Jetpack Compose `BottomSheetScaffold` hosting the system `WebView` (Vanadium WebView on GrapheneOS) directly inside the `VoiceInteractionSession` window so users can resize the crop box, add follow-up text (*"Add to your search"*), and browse results seamlessly.
-- **100% Offline Text, Entity & QR Extraction:** Uses **PaddleOCR v4 Mobile** via **ONNX Runtime** in an air-gapped `android:isolatedProcess="true"` sandbox for on-screen text and its positions. `AssistStructure` supplies correction hints and fallback text. Pure JVM `ZXing` decodes QR codes and barcodes.
+- **100% Offline Text, Entity & QR Extraction:** Uses **PP-OCRv6 Tiny** via **ONNX Runtime** in an air-gapped `android:isolatedProcess="true"` sandbox for on-screen text and its positions. `AssistStructure` supplies correction hints and fallback text. Pure JVM `ZXing` decodes QR codes and barcodes.
 - **GrapheneOS Hardened & Reproducible:** Supports synchronous hardware Memory Tagging (`memtagMode="sync"`), 16KB page sizes, graceful offline degradation when the GrapheneOS Network toggle is disabled, `AndroidKeyStore` StrongBox/TEE encryption for custom API keys, and reproducible multi-ABI GitHub Releases with SLSA Level 3 provenance and `apksigcopier` verification.
 
 ---
@@ -20,7 +20,7 @@
 | **Target Platform** | Android 16–17 (API 36–37): `minSdk` 36, `targetSdk` 37, `compileSdk` 37. 100% Kotlin + Jetpack Compose | Covers current GrapheneOS (Android 17) and the previous release; modern `VoiceInteractionSession`, `SharedMemory`, and 16KB page-alignment support; zero legacy bloat. See §2.1 for what targeting API 37 changes. |
 | **Assistant Role & Trigger** | `VoiceInteractionService` (`ROLE_ASSISTANT`) + AOSP `invocation_type` routing + Quick Settings `TileService` (`showSession()`) | Zero `AccessibilityService` or `MediaProjection` permissions; coexists with power-button voice assistants. |
 | **Process & Network Model** | Single APK with `INTERNET` + `android:isolatedProcess="true"` OCR service + GrapheneOS Network toggle degradation | Enables native single-window bottom-sheet `WebView` UX while sandboxing native C++ OCR inference and supporting air-gapped OS network revocation. |
-| **Text & Entity Extraction** | Primary: Bundled **PaddleOCR v4 Mobile** (`onnxruntime-android >= 1.22.0`) in `/assets/ocr/`<br>Hints and fallback: `AssistStructure` ViewNode tree<br>Offline `com.google.zxing:core` QR/barcode and regex URL/email/phone chips | Screenshot-based word positions, zero disk I/O, zero Play Services, and 16KB page alignment. |
+| **Text & Entity Extraction** | Primary: Bundled **PP-OCRv6 Tiny** (`onnxruntime-android >= 1.22.0`) in `/assets/ocr/`<br>Hints and fallback: `AssistStructure` ViewNode tree<br>Offline `com.google.zxing:core` QR/barcode and regex URL/email/phone chips | Screenshot-based word positions, zero disk I/O, zero Play Services, and 16KB page alignment. |
 | **Visual Upload Pipeline** | **Hybrid Pipeline:**<br>1. In-WebView Chromium `<form>` POST (via `shouldInterceptRequest` RAM stream) for browser engines<br>2. `HttpsURLConnection` for REST/JSON Vision APIs | Preserves authentic Vanadium/Chromium TLS (JA3/JA4) & HTTP/2/3 fingerprint to prevent VPN CAPTCHAs and allows inline CAPTCHA solving. |
 | **Cookie & Anti-CAPTCHA Policy** | **Smart Cookie Retention (Default)** + Pre-seeded `SOCS` consent cookie + 1-tap "Clear Session" broom button + "Strict Ephemeral" toggle | Prevents endless CAPTCHA loops on Mullvad/Proton VPNs and bypasses EU GDPR consent walls that drop image POST payloads. |
 | **Post-Gesture UX** | Text selection on the frozen screen, an explicit **Search** action for image crops, and a unified *"Add to your search"* bar. The *"Confirm Before Uploading Pixels"* setting gates image upload. | Keeps offline text selection separate from image upload and supports multimodal refinement. |
@@ -57,9 +57,9 @@ snipsearch/
 │       │   │   ├── IOcrIsolatedService.aidl
 │       │   │   └── OcrTextBlockParcelable.aidl
 │       │   ├── assets/ocr/
-│       │   │   ├── ch_PP-OCRv4_det_infer.onnx
-│       │   │   ├── ch_PP-OCRv4_rec_infer.onnx
-│       │   │   └── ppocr_keys_v1.txt
+│       │   │   ├── PP-OCRv6_tiny_det_infer.onnx
+│       │   │   ├── PP-OCRv6_tiny_rec_infer.onnx
+│       │   │   └── ppocrv6_tiny_keys.txt
 │       │   ├── kotlin/com/snipsearch/
 │       │   │   ├── SnipSearchApp.kt
 │       │   │   ├── assistant/
@@ -266,12 +266,14 @@ When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
 - Computes absolute screen coordinates `(left, top, right, bottom)` for each `ViewNode` by accumulating parent offsets (`node.left + parentX - parentScrollX`).
 - Include visible screen text from `node.text` and exclude password fields. Accessibility descriptions can label icons and whole rows and have no reliable on-screen text position.
 - Use view bounds and available line metadata to estimate word positions without shifting text origins at viewport edges. The hierarchy can supply a correct string with an approximate or displaced position. Use those estimates as a fallback when OCR is unavailable and the bounds are usable. Phone testing reported large offsets in Android Files and browser text.
+- **Do not expose `AssistStructure` text before OCR finishes:** surfacing view-hierarchy word selection while OCR is still running caused displaced highlights and a jarring layout swap on device and was intentionally reverted.
+- **Future opportunities (non-layout metadata):** Because `AssistStructure` arrives alongside the screenshot without ML cost, its non-layout metadata can be leveraged later without relying on noisy word bounds—for example, using view bounds/widget structure to help filter non-text UI-icon false positives in OCR, or enriching user-triggered entity/action chips with metadata such as `ViewNode.webDomain` or non-truncated strings (strictly on explicit user action).
 
 #### `EntityAndQrDetector` (Offline QR and entities)
 - **QR & Barcode Decoding:** Passes the cropped `Bitmap`'s `IntArray` luminance pixels to `com.google.zxing.MultiFormatReader` (configured for `QR_CODE`, `DATA_MATRIX`, `AZTEC`, `EAN_13`, `CODE_128`) on `Dispatchers.Default`. Zero native C++ code.
 - **Entity Regex / `TextClassifier`:** Scans the selected OCR or fallback text for URLs (`https?://...`), email addresses, phone numbers, and coupon/tracking codes and offers matching action chips.
 
-#### `OcrIsolatedService` (Primary text selection using PaddleOCR v4 Mobile)
+#### `OcrIsolatedService` (Primary text selection using PP-OCRv6 Tiny)
 - Once OCR is available, run it first for on-screen text selection, including when `AssistStructure` also returns text. Return recognized words and their bounds in screenshot coordinates. Use those bounds for highlights, hit tests, and selection handles.
 - Use `AssistStructure` strings as local hints to correct likely OCR misreads when there is a unique, strong match in the same screen area. Keep the OCR bounds and preserve the visibly recognized span. Skip corrections for ambiguous matches, conflicting positions, or text extending past what is visible, such as a truncated filename. Avoid duplicate highlights.
 - **IPC Contract (`IOcrIsolatedService.aidl`):**
@@ -527,9 +529,9 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 - **Next overlay goal:** Prototype text versus image gesture detection in §4.2. Verify geometry-dependent behavior with milestone 4.
 - **Verification:** Unit tests for `AssistStructureParser` coordinate math and `EntityAndQrDetector` QR/URL extraction.
 
-### Milestone 4: Sandboxed PaddleOCR v4 (`android:isolatedProcess="true"`)
+### Milestone 4: Sandboxed PP-OCRv6 Tiny (`android:isolatedProcess="true"`)
 - Define `IOcrIsolatedService.aidl` and `OcrTextBlockParcelable.aidl`.
-- Bundle quantized PaddleOCR v4 Mobile `.onnx` models in `src/main/assets/ocr/`.
+- Bundle quantized PP-OCRv6 Tiny `.onnx` models in `src/main/assets/ocr/`. The recognizer exports only `[1,T]` ArgMax IDs and maximum probabilities; keep Softmax internal and reject uncertain words/glyphs before publishing the complete OCR result. See the pinned upstream hashes and regeneration commands in `assets/ocr/NOTICE.txt`.
 - Implement `OcrIsolatedService`, `PaddleOcrEngine` (Kotlin `Bitmap -> FloatBuffer` preprocessing + `OrtSession` inference + `CtcBeamDecoder`), and `OcrClientCoordinator` (`SharedMemory` + `AssetFileDescriptor` IPC).
 - Use screenshot-coordinate OCR word bounds for text selection and test hierarchy-assisted corrections against displaced bounds, repeated labels, and truncated filenames. Retest highlight alignment and text drags on a real phone in Android Files and a browser, including after scrolling.
 - **Verification:** Instrumentation/Robolectric tests verifying zero temp files created during OCR and clean recovery if the isolated service is killed.

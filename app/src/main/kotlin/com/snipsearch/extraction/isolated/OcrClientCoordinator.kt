@@ -13,6 +13,7 @@ import com.snipsearch.extraction.OcrLine
 import com.snipsearch.extraction.OcrWord
 import com.snipsearch.extraction.PixelRegion
 import com.snipsearch.ipc.IOcrIsolatedService
+import com.snipsearch.ipc.IOcrProgressCallback
 import com.snipsearch.ipc.OcrTextBlockParcelable
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -40,6 +41,12 @@ import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+internal data class OcrReadyInfo(
+    val bindMs: Long,
+    val initMs: Long,
+    val reused: Boolean,
+)
+
 internal class OcrClientCoordinator(
     private val context: Context,
     private val idleUnbindDelayMs: Long = DEFAULT_IDLE_UNBIND_DELAY_MS,
@@ -59,9 +66,7 @@ internal class OcrClientCoordinator(
 
     private var idleJob: Job? = null
 
-    suspend fun warmUp() {
-        ensureReady()
-    }
+    suspend fun warmUp(): OcrReadyInfo = ensureReady().info
 
     // Copy synchronously while the overlay still owns the crop. Only the protected mapping
     // crosses a suspension point, so hiding the overlay can recycle its bitmap immediately.
@@ -70,10 +75,24 @@ internal class OcrClientCoordinator(
         return pixels.use { recognize(it) }
     }
 
-    suspend fun recognize(pixels: CropPixels): List<OcrLine> {
-        val connection = ensureReady()
-        val service = connection.service ?: throw IOException("OCR service disconnected")
+    suspend fun recognize(
+        pixels: CropPixels,
+        onReady: (OcrReadyInfo) -> Unit = {},
+        onDetect: (Int, Long) -> Unit = { _, _ -> },
+    ): List<OcrLine> {
+        val ready = ensureReady()
+        onReady(ready.info)
+        val service = ready.connection.service ?: throw IOException("OCR service disconnected")
         val requestId = nextRequestId.incrementAndGet()
+        val cancelled = AtomicBoolean(false)
+
+        val callback = object : IOcrProgressCallback.Stub() {
+            override fun onDetectionComplete(regionCount: Int, detectMs: Long) {
+                if (!cancelled.get()) {
+                    onDetect(regionCount, detectMs)
+                }
+            }
+        }
 
         activeRequestId.set(requestId)
         activeService = service
@@ -89,6 +108,7 @@ internal class OcrClientCoordinator(
                             pixels.width,
                             pixels.height,
                             pixels.width,
+                            callback,
                         )
                         val lines = parcelables.mapNotNull { it.toOcrLineOrNull() }
                         if (cont.isActive) {
@@ -96,7 +116,7 @@ internal class OcrClientCoordinator(
                         }
                     } catch (failure: Throwable) {
                         if (failure is RemoteException || failure is IllegalStateException) {
-                            evictConnection(connection)
+                            evictConnection(ready.connection)
                         }
                         if (cont.isActive) {
                             cont.resumeWithException(failure)
@@ -104,11 +124,13 @@ internal class OcrClientCoordinator(
                     }
                 }
                 cont.invokeOnCancellation {
+                    cancelled.set(true)
                     runCatching { service.cancelRecognition(requestId) }
                     callJob.cancel()
                 }
             }
         } finally {
+            cancelled.set(true)
             activeRequestId.compareAndSet(requestId, 0L)
             if (activeService === service) {
                 activeService = null
@@ -152,14 +174,14 @@ internal class OcrClientCoordinator(
         lifecycleScope.cancel()
     }
 
-    private suspend fun ensureReady(): OcrConnection = withContext(Dispatchers.IO) {
+    private suspend fun ensureReady(): ReadyConnection = withContext(Dispatchers.IO) {
         connectionMutex.withLock {
             synchronized(activeLock) {
                 idleJob?.cancel()
                 idleJob = null
                 val existing = activeConnection
                 if (existing != null && existing.isHealthy()) {
-                    return@withLock existing
+                    return@withLock ReadyConnection(existing, OcrReadyInfo(bindMs = 0L, initMs = 0L, reused = true))
                 }
                 if (existing != null) {
                     activeConnection = null
@@ -170,6 +192,7 @@ internal class OcrClientCoordinator(
             val startGen = releaseGeneration.get()
             val conn = OcrConnection { broken -> evictConnection(broken) }
             val intent = Intent(context, OcrIsolatedService::class.java)
+            val bindStartNanos = System.nanoTime()
             val bound = context.bindService(intent, Context.BIND_AUTO_CREATE, Executor { it.run() }, conn)
             if (!bound) {
                 conn.unbound.set(true)
@@ -179,14 +202,17 @@ internal class OcrClientCoordinator(
             try {
                 val service = withTimeoutOrNull(BIND_TIMEOUT_MS) { conn.serviceDeferred.await() }
                     ?: throw IOException("Could not connect to OCR service")
+                val bindMs = (System.nanoTime() - bindStartNanos) / 1_000_000L
 
-                context.assets.openFd("ocr/ch_PP-OCRv4_det_infer.onnx").use { detector ->
-                    context.assets.openFd("ocr/ch_PP-OCRv4_rec_infer.onnx").use { recognizer ->
-                        context.assets.openFd("ocr/ppocr_keys_v1.txt").use { dictionary ->
+                val initStartNanos = System.nanoTime()
+                context.assets.openFd("ocr/PP-OCRv6_tiny_det_infer.onnx").use { detector ->
+                    context.assets.openFd("ocr/PP-OCRv6_tiny_rec_infer.onnx").use { recognizer ->
+                        context.assets.openFd("ocr/ppocrv6_tiny_keys.txt").use { dictionary ->
                             service.initializeModels(detector, recognizer, dictionary)
                         }
                     }
                 }
+                val initMs = (System.nanoTime() - initStartNanos) / 1_000_000L
 
                 if (conn.dead || !service.asBinder().isBinderAlive) {
                     throw IOException("OCR service disconnected")
@@ -202,7 +228,7 @@ internal class OcrClientCoordinator(
                     }
                     activeConnection = conn
                 }
-                conn
+                ReadyConnection(conn, OcrReadyInfo(bindMs = bindMs, initMs = initMs, reused = false))
             } catch (failure: Throwable) {
                 unbindOnce(conn)
                 throw failure
@@ -231,6 +257,11 @@ internal class OcrClientCoordinator(
             }
         }
     }
+
+    private data class ReadyConnection(
+        val connection: OcrConnection,
+        val info: OcrReadyInfo,
+    )
 
     private class OcrConnection(
         private val onBroken: (OcrConnection) -> Unit,

@@ -37,6 +37,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -57,6 +58,7 @@ import com.snipsearch.extraction.EntityAndQrDetector
 import com.snipsearch.extraction.EntityKind
 import com.snipsearch.extraction.OcrLine
 import com.snipsearch.extraction.OcrTextCorrection
+import com.snipsearch.extraction.OcrTiming
 import com.snipsearch.extraction.PixelRegion
 import com.snipsearch.extraction.isolated.OcrClientCoordinator
 import com.snipsearch.extraction.isolated.OcrScanSnapshot
@@ -88,6 +90,7 @@ internal fun OverlayScreen(
     screenshotScreenBounds: PixelRegion? = null,
     ocrRunner: SessionOcrRunner? = null,
     fullScreenScanId: Long = 0L,
+    timing: OcrTiming? = null,
 ) {
     val context = LocalContext.current.applicationContext
     val ownedRunner = remember(context, ocrRunner) {
@@ -127,14 +130,14 @@ internal fun OverlayScreen(
                     ) {
                         val id = activeRunner.nextScanId()
                         localFullScanId = id
-                        activeRunner.startScan(id, screenshot)
+                        activeRunner.startScan(id, screenshot, timing)
                     }
                 }
             } else {
                 LaunchedEffect(crop) {
                     val id = activeRunner.nextScanId()
                     cropScanId = id
-                    activeRunner.startScan(id, crop.bitmap)
+                    activeRunner.startScan(id, crop.bitmap, timing = null)
                 }
             }
 
@@ -159,7 +162,7 @@ internal fun OverlayScreen(
                     } else {
                         retryFullScanId = id
                     }
-                    activeRunner.startScan(id, source)
+                    activeRunner.startScan(id, source, if (crop == null) timing else null)
                 }
             }
 
@@ -178,6 +181,7 @@ internal fun OverlayScreen(
                         ocrComplete = ocrComplete,
                         ocrFailed = ocrFailed,
                         codes = codes.orEmpty(),
+                        timing = null,
                         onRetryOcr = onRetryOcr,
                         onDismiss = onDismiss,
                     )
@@ -243,6 +247,7 @@ internal fun OverlayScreen(
                         ocrComplete = ocrComplete,
                         ocrFailed = ocrFailed,
                         codes = emptyList(),
+                        timing = timing,
                         onRetryOcr = onRetryOcr,
                         onDismiss = onDismiss,
                         onImageMode = { imageMode = true },
@@ -271,6 +276,7 @@ private fun BoxScope.TextSelection(
     ocrComplete: Boolean,
     ocrFailed: Boolean,
     codes: List<DetectedEntity>,
+    timing: OcrTiming?,
     onRetryOcr: () -> Unit,
     onDismiss: () -> Unit,
     onImageMode: (() -> Unit)? = null,
@@ -315,6 +321,17 @@ private fun BoxScope.TextSelection(
                 }
                 TextOptions(corrected.map { AssistTextBlock(it.text, it.bounds) }, words)
             }
+        }
+    }
+    LaunchedEffect(timing, options?.words?.isNotEmpty(), lines?.isNotEmpty()) {
+        val currentOptions = options ?: return@LaunchedEffect
+        if (timing == null || currentOptions.words.isEmpty()) return@LaunchedEffect
+        withFrameNanos { }
+        val fromOcr = lines?.isNotEmpty() == true
+        val label = if (fromOcr) "ocr_final" else "assist"
+        timing.logFirstSelectableFrame(label, currentOptions.words.size)
+        if (fromOcr) {
+            timing.logFirstOcrSelectableFrame("ocr_final", currentOptions.words.size)
         }
     }
     var selection by remember(options?.words?.map { it.bounds }) { mutableStateOf<IntRange?>(null) }
