@@ -23,8 +23,8 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
    - The app is a single APK declaring `android.permission.INTERNET` to support the in-app Vanadium/System `WebView` bottom sheet and visual search uploads.
    - If the user revokes the **GrapheneOS Network toggle** (removing `AID_INET` / `GID 3003`), the app MUST NOT crash. It must detect offline state via `ConnectivityManager` / `SocketException`, disable the embedded `WebView` and remote image uploads, and degrade gracefully to offline text/QR extraction (`AssistStructure` + `PaddleOCR` + `ZXing`) and external browser `Intent.ACTION_VIEW` handoff.
 4. **Isolated Process On-Device OCR (`android:isolatedProcess="true"`):**
-   - Primary text extraction uses `AssistStructure.ViewNode` bounds intersection (zero ML overhead).
-   - Pixel-baked text extraction runs **PP-OCRv6 Tiny** (`det` + `rec` `.onnx` models bundled uncompressed in `src/main/assets/ocr/`) via `onnxruntime-android` (`>= 1.22.0`) inside an `android:isolatedProcess="true"` bound `Service` (`OcrIsolatedService`).
+   - Primary on-screen text extraction and word bounds come from **PP-OCRv6 Tiny** (`det` + `rec` `.onnx` models bundled uncompressed in `src/main/assets/ocr/`) via `onnxruntime-android` (`>= 1.22.0`) inside an `android:isolatedProcess="true"` bound `Service` (`OcrIsolatedService`).
+   - `AssistStructure.ViewNode` data is kept for `FLAG_SECURE`/blocked-assist detection, local OCR misread correction hints (`OcrTextCorrection`), and fallback text selection when OCR returns no text or fails. Do **not** expose `AssistStructure` words as selectable before OCR completes (displaced view bounds and the mid-session swap degrade UX).
    - Pass cropped `Bitmap` data and `.onnx` model descriptors across the Binder boundary using `SharedMemory` (`ashmem` / `ParcelFileDescriptor`) and `AssetFileDescriptor`.
 
 ---

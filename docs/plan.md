@@ -266,6 +266,8 @@ When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
 - Computes absolute screen coordinates `(left, top, right, bottom)` for each `ViewNode` by accumulating parent offsets (`node.left + parentX - parentScrollX`).
 - Include visible screen text from `node.text` and exclude password fields. Accessibility descriptions can label icons and whole rows and have no reliable on-screen text position.
 - Use view bounds and available line metadata to estimate word positions without shifting text origins at viewport edges. The hierarchy can supply a correct string with an approximate or displaced position. Use those estimates as a fallback when OCR is unavailable and the bounds are usable. Phone testing reported large offsets in Android Files and browser text.
+- **Do not expose `AssistStructure` text before OCR finishes:** surfacing view-hierarchy word selection while OCR is still running caused displaced highlights and a jarring layout swap on device and was intentionally reverted.
+- **Future opportunities (non-layout metadata):** Because `AssistStructure` arrives alongside the screenshot without ML cost, its non-layout metadata can be leveraged later without relying on noisy word bounds—for example, using view bounds/widget structure to help filter non-text UI-icon false positives in OCR, or enriching user-triggered entity/action chips with metadata such as `ViewNode.webDomain` or non-truncated strings (strictly on explicit user action).
 
 #### `EntityAndQrDetector` (Offline QR and entities)
 - **QR & Barcode Decoding:** Passes the cropped `Bitmap`'s `IntArray` luminance pixels to `com.google.zxing.MultiFormatReader` (configured for `QR_CODE`, `DATA_MATRIX`, `AZTEC`, `EAN_13`, `CODE_128`) on `Dispatchers.Default`. Zero native C++ code.
