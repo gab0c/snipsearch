@@ -12,11 +12,15 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.DeadObjectException
 import android.os.SharedMemory
+import com.snipsearch.extraction.OcrTiming
 import com.snipsearch.extraction.PixelRegion
 import com.snipsearch.ipc.IOcrIsolatedService
+import com.snipsearch.ipc.IOcrProgressCallback
 import com.snipsearch.ipc.OcrTextBlockParcelable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -34,6 +38,7 @@ import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 @RunWith(RobolectricTestRunner::class)
@@ -58,13 +63,24 @@ class OcrClientCoordinatorTest {
         val coordinator = OcrClientCoordinator(context)
         val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
         try {
-            runBlocking { coordinator.warmUp() }
+            val warmInfo = runBlocking { coordinator.warmUp() }
+            assertFalse(warmInfo.reused)
             assertEquals(1, context.bindings)
             assertEquals(1, context.initializations)
             assertEquals(0, context.unbindings)
 
-            val firstLines = runBlocking { coordinator.recognize(crop) }
+            var firstReused = false
+            val firstPixels = OcrClientCoordinator.CropPixels.copy(crop)!!
+            val firstLines = firstPixels.use { pixels ->
+                runBlocking {
+                    coordinator.recognize(pixels, onReady = { firstReused = it.reused })
+                }
+            }
+            assertTrue(firstReused)
             assertEquals("sample", firstLines.single().text)
+
+            val secondLines = runBlocking { coordinator.recognize(crop) }
+            assertEquals("sample", secondLines.single().text)
             assertEquals(1, context.bindings)
             assertEquals(1, context.initializations)
             assertEquals(0, context.unbindings)
@@ -73,8 +89,8 @@ class OcrClientCoordinatorTest {
             assertEquals(1, context.unbindings)
 
             // Subsequent recognition after release binds a fresh connection.
-            val secondLines = runBlocking { coordinator.recognize(crop) }
-            assertEquals("sample", secondLines.single().text)
+            val thirdLines = runBlocking { coordinator.recognize(crop) }
+            assertEquals("sample", thirdLines.single().text)
             assertEquals(2, context.bindings)
             assertEquals(2, context.initializations)
             coordinator.destroy()
@@ -110,44 +126,126 @@ class OcrClientCoordinatorTest {
     }
 
     @Test
-    fun cancellingRecognitionNotifiesIsolatedService() {
+    fun detectionCallbackEmitsAndCancellationSignalsService() {
         val startedLatch = CountDownLatch(1)
-        val blockRecognize = CountDownLatch(1)
+        val releaseRecognize = CountDownLatch(1)
         val context = FakeOcrServiceContext(
             application,
+            emitDetectCallback = true,
             onRecognizeStart = { startedLatch.countDown() },
-            waitBeforeFinish = blockRecognize,
+            waitBeforeFinish = releaseRecognize,
         )
         val coordinator = OcrClientCoordinator(context)
         val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
-        val pixels = OcrClientCoordinator.CropPixels.copy(crop)!!
         try {
-            runBlocking {
-                val job = launch(Dispatchers.Default) {
-                    coordinator.recognize(pixels)
+            val detectedCount = AtomicInteger(0)
+            val pixels = OcrClientCoordinator.CropPixels.copy(crop)!!
+            pixels.use { p ->
+                runBlocking {
+                    val job = async(Dispatchers.Default) {
+                        coordinator.recognize(
+                            pixels = p,
+                            onDetect = { count, _ -> detectedCount.set(count) },
+                        )
+                    }
+                    assertTrue(startedLatch.await(3, TimeUnit.SECONDS))
+                    releaseRecognize.countDown()
+                    val result = job.await()
+                    assertEquals(1, detectedCount.get())
+                    assertEquals("sample", result.single().text)
                 }
-                assertTrue(startedLatch.await(3, TimeUnit.SECONDS))
-                job.cancel(CancellationException("crop changed"))
-                job.join()
-                assertTrue(context.lastCancelledRequestId.get() > 0L)
             }
-        } finally {
-            blockRecognize.countDown()
-            pixels.close()
+
+            // Now test cancelling an in-flight recognition notifies cancelRecognition().
+            val secondStarted = CountDownLatch(1)
+            val blockForever = CountDownLatch(1)
+            val blockingContext = FakeOcrServiceContext(
+                application,
+                onRecognizeStart = { secondStarted.countDown() },
+                waitBeforeFinish = blockForever,
+            )
+            val cancelCoordinator = OcrClientCoordinator(blockingContext)
+            val secondPixels = OcrClientCoordinator.CropPixels.copy(crop)!!
+            try {
+                runBlocking {
+                    val job = launch(Dispatchers.Default) {
+                        cancelCoordinator.recognize(secondPixels)
+                    }
+                    assertTrue(secondStarted.await(3, TimeUnit.SECONDS))
+                    job.cancel(CancellationException("crop changed"))
+                    job.join()
+                    assertTrue(blockingContext.lastCancelledRequestId.get() > 0L)
+                }
+            } finally {
+                blockForever.countDown()
+                secondPixels.close()
+                cancelCoordinator.destroy()
+            }
             coordinator.destroy()
+        } finally {
+            releaseRecognize.countDown()
             crop.recycle()
         }
     }
 
     @Test
-    fun sessionOcrRunnerCompletesAndCancelsSynchronouslyBeforeBitmapRecycle() {
-        val context = FakeOcrServiceContext(application)
-        val runner = SessionOcrRunner(OcrClientCoordinator(context))
+    fun sessionOcrRunnerCancelsInvalidatesAndEmitsContentFreeTimingLogs() {
+        val startedLatch = CountDownLatch(1)
+        val releaseRecognize = CountDownLatch(1)
+        val context = FakeOcrServiceContext(
+            application,
+            emitDetectCallback = true,
+            onRecognizeStart = { startedLatch.countDown() },
+            waitBeforeFinish = releaseRecognize,
+        )
+        val coordinator = OcrClientCoordinator(context)
+        val runner = SessionOcrRunner(coordinator)
+        val logs = mutableListOf<String>()
+        var clockMs = 100L
+        val timing = OcrTiming.start(
+            invocationType = 1,
+            clock = { clockMs },
+            logger = { logs += it },
+        )
         val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
         try {
-            runner.warmUp()
             val scanId = runner.nextScanId()
-            runner.startScan(scanId, bitmap)
+            clockMs = 120L
+            timing.logCaptureArrived(bitmap.width, bitmap.height)
+            runner.startScan(scanId, bitmap, timing)
+            assertTrue(startedLatch.await(3, TimeUnit.SECONDS))
+
+            // Cancelling invalidates state immediately before caller recycles bitmap.
+            runner.cancelActiveScan()
+            bitmap.recycle()
+            releaseRecognize.countDown()
+
+            assertEquals(OcrScanSnapshot.IDLE, runner.state.value)
+            assertTrue(context.lastCancelledRequestId.get() > 0L)
+
+            // Verify timing logs contain zero screen text or sample strings.
+            assertTrue(logs.any { it.contains("event=invoke") })
+            assertTrue(logs.any { it.contains("event=capture_arrived") })
+            assertFalse(logs.any { it.contains("sample") })
+        } finally {
+            releaseRecognize.countDown()
+            runner.onSessionDestroy()
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+    }
+
+    @Test
+    fun sessionOcrRunnerCompletesFullScanAndReusesWarmService() {
+        val context = FakeOcrServiceContext(application, emitDetectCallback = true)
+        val coordinator = OcrClientCoordinator(context)
+        val runner = SessionOcrRunner(coordinator)
+        val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val logs = mutableListOf<String>()
+        val timing = OcrTiming.start(1, logger = { logs += it })
+        try {
+            runner.warmUp(timing)
+            val scanId = runner.nextScanId()
+            runner.startScan(scanId, bitmap, timing)
             runBlocking {
                 withTimeout(4_000) {
                     while (runner.state.value.status != OcrScanSnapshot.Status.COMPLETE) {
@@ -155,35 +253,15 @@ class OcrClientCoordinatorTest {
                     }
                 }
             }
-            assertEquals(scanId, runner.state.value.scanId)
-            assertEquals("sample", runner.state.value.lines.single().text)
+            val snapshot = runner.state.value
+            assertEquals(scanId, snapshot.scanId)
+            assertEquals("sample", snapshot.lines.single().text)
+            assertTrue(logs.any { it.contains("event=ocr_detect_done") })
+            assertTrue(logs.any { it.contains("event=ocr_complete") })
+            assertFalse(logs.any { it.contains("sample") })
         } finally {
             runner.onSessionDestroy()
             bitmap.recycle()
-        }
-
-        val startedLatch = CountDownLatch(1)
-        val releaseRecognize = CountDownLatch(1)
-        val blockingContext = FakeOcrServiceContext(
-            application,
-            onRecognizeStart = { startedLatch.countDown() },
-            waitBeforeFinish = releaseRecognize,
-        )
-        val cancelRunner = SessionOcrRunner(OcrClientCoordinator(blockingContext))
-        val cancelBitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
-        try {
-            val scanId = cancelRunner.nextScanId()
-            cancelRunner.startScan(scanId, cancelBitmap)
-            assertTrue(startedLatch.await(3, TimeUnit.SECONDS))
-            cancelRunner.cancelActiveScan()
-            cancelBitmap.recycle()
-            releaseRecognize.countDown()
-            assertEquals(OcrScanSnapshot.IDLE, cancelRunner.state.value)
-            assertTrue(blockingContext.lastCancelledRequestId.get() > 0L)
-        } finally {
-            releaseRecognize.countDown()
-            cancelRunner.onSessionDestroy()
-            if (!cancelBitmap.isRecycled) cancelBitmap.recycle()
         }
     }
 
@@ -193,6 +271,7 @@ class OcrClientCoordinatorTest {
     private class FakeOcrServiceContext(
         base: Context,
         private val dieOnBindingNumber: Int = -1,
+        private val emitDetectCallback: Boolean = false,
         private val onRecognizeStart: (() -> Unit)? = null,
         private val waitBeforeFinish: CountDownLatch? = null,
     ) : ContextWrapper(base) {
@@ -209,9 +288,9 @@ class OcrClientCoordinatorTest {
                     detector: AssetFileDescriptor, recognizer: AssetFileDescriptor, dictionary: AssetFileDescriptor,
                 ) {
                     initializations++
-                    assertTrue(detector.length > 1_000_000)
-                    assertTrue(recognizer.length > 1_000_000)
-                    assertTrue(dictionary.length > 20_000)
+                    assertTrue(detector.length > 300_000)
+                    assertTrue(recognizer.length > 500_000)
+                    assertTrue(dictionary.length > 1_000)
                 }
 
                 override fun recognizeCrop(
@@ -220,6 +299,7 @@ class OcrClientCoordinatorTest {
                     width: Int,
                     height: Int,
                     stride: Int,
+                    callback: IOcrProgressCallback?,
                 ): List<OcrTextBlockParcelable> {
                     val mapping = argbPixels.mapReadOnly()
                     try {
@@ -229,6 +309,9 @@ class OcrClientCoordinatorTest {
                     }
                     onRecognizeStart?.invoke()
                     if (shouldDie) throw DeadObjectException()
+                    if (emitDetectCallback) {
+                        callback?.onDetectionComplete(1, 5L)
+                    }
                     waitBeforeFinish?.await(3, TimeUnit.SECONDS)
                     if (requestId <= lastCancelledRequestId.get()) return emptyList()
                     return listOf(block("sample"))

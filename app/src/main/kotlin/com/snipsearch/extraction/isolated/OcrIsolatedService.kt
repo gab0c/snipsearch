@@ -3,10 +3,13 @@ package com.snipsearch.extraction.isolated
 import android.app.Service
 import android.content.Intent
 import android.content.res.AssetFileDescriptor
+import android.os.RemoteException
 import android.os.SharedMemory
 import com.snipsearch.ipc.IOcrIsolatedService
+import com.snipsearch.ipc.IOcrProgressCallback
 import com.snipsearch.ipc.OcrTextBlockParcelable
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 class OcrIsolatedService : Service() {
@@ -37,6 +40,7 @@ class OcrIsolatedService : Service() {
             width: Int,
             height: Int,
             stride: Int,
+            callback: IOcrProgressCallback?,
         ): List<OcrTextBlockParcelable> = argbPixels.use { shared ->
             if (requestId <= cancelledUpTo.get()) return emptyList()
             runOcr {
@@ -44,11 +48,25 @@ class OcrIsolatedService : Service() {
                 require(shared.size == pixelBufferSize(width, height, stride))
                 val ocr = checkNotNull(engine)
                 val mapping = shared.mapReadOnly()
+                val callbackBroken = AtomicBoolean(false)
                 try {
                     val pixels = mapping.order(ByteOrder.nativeOrder()).asIntBuffer()
-                    ocr.recognize(pixels, width, height, stride) {
-                        requestId <= cancelledUpTo.get()
-                    }
+                    ocr.recognize(
+                        argb = pixels,
+                        width = width,
+                        height = height,
+                        stride = stride,
+                        isCancelled = { requestId <= cancelledUpTo.get() || callbackBroken.get() },
+                        onDetected = { count, detMs ->
+                            if (callback != null && !callbackBroken.get() && requestId > cancelledUpTo.get()) {
+                                try {
+                                    callback.onDetectionComplete(count, detMs)
+                                } catch (_: RemoteException) {
+                                    callbackBroken.set(true)
+                                }
+                            }
+                        },
+                    )
                 } finally {
                     SharedMemory.unmap(mapping)
                 }

@@ -14,13 +14,22 @@ import kotlin.math.sin
  * and expands each rectangle to recover the edges of the text line.
  */
 internal object TextDetector {
+    private const val PIXEL_THRESH = 0.20f
+    private const val REGION_SCORE_THRESH = 0.40
+    private const val UNCLIP_RATIO = 1.4
+
     fun regions(map: FloatBuffer, width: Int, height: Int): List<TextRegion> {
-        val seen = BooleanArray(width * height)
-        val queue = IntArray(seen.size)
+        val totalPixels = width * height
+        val probs = FloatArray(totalPixels)
+        val seen = BooleanArray(totalPixels)
+        val queue = IntArray(totalPixels)
         val regions = mutableListOf<TextRegion>()
         try {
-            for (start in seen.indices) {
-                if (seen[start] || map[start] < 0.30f) continue
+            val view = map.duplicate()
+            view.position(0)
+            view.get(probs)
+            for (start in probs.indices) {
+                if (seen[start] || probs[start] < PIXEL_THRESH) continue
                 var head = 0
                 var tail = 1
                 queue[0] = start
@@ -35,7 +44,7 @@ internal object TextDetector {
                     val index = queue[head++]
                     val x = index % width
                     val y = index / width
-                    total += map[index]
+                    total += probs[index]
                     sumX += x
                     sumY += y
                     sumXX += x.toDouble() * x
@@ -44,14 +53,14 @@ internal object TextDetector {
                     for (ny in maxOf(0, y - 1)..minOf(height - 1, y + 1)) {
                         for (nx in maxOf(0, x - 1)..minOf(width - 1, x + 1)) {
                             val neighbor = ny * width + nx
-                            if (!seen[neighbor] && map[neighbor] >= 0.30f) {
+                            if (!seen[neighbor] && probs[neighbor] >= PIXEL_THRESH) {
                                 seen[neighbor] = true
                                 queue[tail++] = neighbor
                             }
                         }
                     }
                 }
-                if (tail < 6 || total / tail < 0.55) continue
+                if (tail < 6 || total / tail < REGION_SCORE_THRESH) continue
                 val angle = 0.5 * atan2(2 * (sumXY - sumX * sumY / tail),
                     sumXX - sumX * sumX / tail - sumYY + sumY * sumY / tail)
                 val dx = cos(angle)
@@ -73,11 +82,12 @@ internal object TextDetector {
                 val w = right - left + 1
                 val h = bottom - top + 1
                 if (minOf(w, h) < 3) continue
-                val pad = 0.5 + 1.5 * w * h / (2 * (w + h))
+                val pad = 0.5 + UNCLIP_RATIO * w * h / (2 * (w + h))
                 regions += TextRegion(left - pad, top - pad, right + pad, bottom + pad, dx, dy)
             }
             return regions.sortedWith(compareBy({ it.y(0.5, 0.5) }, { it.x(0.5, 0.5) })).take(96)
         } finally {
+            probs.fill(0f)
             queue.fill(0)
             seen.fill(false)
         }

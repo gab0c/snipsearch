@@ -3,6 +3,7 @@ package com.snipsearch.extraction.isolated
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.nio.FloatBuffer
+import java.nio.LongBuffer
 
 class CtcBeamDecoderTest {
     private val decoder = CtcBeamDecoder(listOf("a", "b", " "))
@@ -26,6 +27,8 @@ class CtcBeamDecoderTest {
 
     @Test
     fun handlesLowConfidenceTieBreakAndConsecutiveSpacesWithoutEarlyExit() {
+        // Every class < 0.5 so full scan runs across all classes; consecutive blanks/spaces collapse cleanly.
+        val classes = 4
         val data = floatArrayOf(
             0.22f, 0.34f, 0.22f, 0.22f, // token 1 ("a")
             0.20f, 0.20f, 0.20f, 0.40f, // token 3 (" ")
@@ -40,5 +43,23 @@ class CtcBeamDecoderTest {
             listOf(DecodedWord("a", 0, 1), DecodedWord("bb", 3, 6)),
             decoder.decode(scores, 6),
         )
+    }
+
+    @Test
+    fun decodesArgMaxTokenIdsWithBlanksSpacesOutOfRangeIdsAndPreservesPosition() {
+        val tokens = LongBuffer.wrap(longArrayOf(0L, 1L, 1L, 0L, 1L, 3L, 3L, 0L, 2L, 99L, 2L, -1L))
+        tokens.position(4)
+
+        assertEquals(
+            listOf(DecodedWord("aa", 1, 5), DecodedWord("bb", 8, 11)),
+            decoder.decodeTokens(tokens, 12),
+        )
+        assertEquals(4, tokens.position())
+    }
+
+    @Test
+    fun argMaxBlankAndOutOfRangeOnlyProducesNoWords() {
+        val tokens = LongBuffer.wrap(longArrayOf(0L, -3L, 4L, 0L))
+        assertEquals(emptyList<DecodedWord>(), decoder.decodeTokens(tokens, 4))
     }
 }
