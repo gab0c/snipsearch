@@ -19,11 +19,12 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
+import com.snipsearch.ui.theme.SnipColors
 import kotlinx.coroutines.flow.collectLatest
 
 private const val SPEED_MEMORY_MILLIS = 140L
 private const val HALO_FADE_MILLIS = 240L
-private val haloColor = Color(0xFF6AAEFF)
+private val haloColor = SnipColors.SnipBlueGlow
 
 @Composable
 internal fun rememberSelectionGlowTrail(vararg keys: Any?): SelectionGlowTrail {

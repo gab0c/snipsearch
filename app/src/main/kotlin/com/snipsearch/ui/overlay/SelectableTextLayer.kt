@@ -22,6 +22,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import com.snipsearch.extraction.AssistTextBlock
 import com.snipsearch.extraction.PixelRegion
+import com.snipsearch.ui.theme.SnipColors
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -113,7 +114,7 @@ internal fun SelectableTextLayer(
     val trail = rememberSelectionGlowTrail(words, viewport, screen)
     val current by rememberUpdatedState(selection)
     val update by rememberUpdatedState(onSelect)
-    val highlight = Color(0xFF49B5A7)
+    val highlight = SnipColors.SnipBlueGlow
     fun anchor(index: Int, start: Boolean): Offset {
         val rect = rects[index]
         return Offset(if (start != words[index].rtl) rect.left else rect.right, rect.bottom)

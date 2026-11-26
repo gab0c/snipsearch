@@ -13,7 +13,6 @@ import android.util.Log
 import android.view.Display
 import android.view.View
 import android.widget.TextView
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
@@ -29,6 +28,7 @@ import com.snipsearch.extraction.isolated.OcrClientCoordinator
 import com.snipsearch.extraction.isolated.SessionOcrRunner
 import com.snipsearch.security.SessionMemory
 import com.snipsearch.ui.overlay.OverlayScreen
+import com.snipsearch.ui.theme.SnipTheme
 
 /**
  * Assistant session window.
@@ -258,7 +258,7 @@ class SnipVoiceInteractionSession(
             overlayScreenshot.value = screenshot
             view.visibility = View.VISIBLE
             view.setContent {
-                MaterialTheme {
+                SnipTheme {
                     OverlayScreen(
                         screenshot = overlayScreenshot.value,
                         assistStructures = overlayAssist.value,
