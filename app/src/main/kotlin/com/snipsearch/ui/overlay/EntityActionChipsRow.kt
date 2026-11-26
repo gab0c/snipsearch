@@ -1,5 +1,6 @@
 package com.snipsearch.ui.overlay
 
+import android.app.SearchManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -64,6 +65,12 @@ internal fun EntityActionChipsRow(
         if (selectedText.isNotEmpty()) {
             item {
                 AssistChip(
+                    onClick = { if (context.searchWeb(selectedText)) onExternalAction() },
+                    label = { Text(stringResource(R.string.overlay_search_web)) },
+                )
+            }
+            item {
+                AssistChip(
                     onClick = { context.copyExtraction(selectedText) },
                     label = { Text(stringResource(R.string.overlay_copy_text)) },
                 )
@@ -86,6 +93,18 @@ private fun Context.actOn(entity: DetectedEntity): Boolean {
             return false
         }
     }
+    return openSelectionIntent(intent)
+}
+
+/** Browser support varies; leave the overlay open when no handler accepts the query. */
+internal fun Context.searchWeb(query: String): Boolean {
+    if (query.isBlank()) return false
+    return openSelectionIntent(
+        Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, query),
+    )
+}
+
+private fun Context.openSelectionIntent(intent: Intent): Boolean {
     return try {
         startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         true
