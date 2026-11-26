@@ -124,4 +124,28 @@ class TextDetectorTest {
         assertTrue(tight.height < full.height)
     }
 
+    @Test
+    fun snapsNearHorizontalLinesToZeroDyWithoutSnappingAngledTextAndReusesScratch() {
+        val scratch = TextDetectorScratch()
+        // Slight ~0.9 deg skew across a wide 64x64 map should snap to exact horizontal.
+        val skewed = FloatBuffer.allocate(64 * 64)
+        for (x in 4 until 60) {
+            val yBase = 20 + if (x >= 32) 1 else 0
+            for (dy in 0 until 4) skewed.put((yBase + dy) * 64 + x, 0.90f)
+        }
+        val snapped = TextDetector.regions(skewed, 64, 64, scratch).single()
+        assertEquals(1.0, snapped.dx, 0.0)
+        assertEquals(0.0, snapped.dy, 0.0)
+
+        // Reuse the larger scratch on a smaller 48x48 angled map (~12 deg) without snapping.
+        val angled = FloatBuffer.allocate(48 * 48)
+        for (x in 6 until 42) {
+            val yBase = 10 + (x / 5)
+            for (dy in 0 until 4) angled.put((yBase + dy) * 48 + x, 0.90f)
+        }
+        val rotated = TextDetector.regions(angled, 48, 48, scratch).single()
+        assertTrue(kotlin.math.abs(rotated.dy) > 0.15)
+        scratch.scrub()
+    }
+
 }

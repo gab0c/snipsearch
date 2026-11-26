@@ -62,6 +62,7 @@ import com.snipsearch.extraction.EntityKind
 import com.snipsearch.extraction.OcrLine
 import com.snipsearch.extraction.OcrTextCorrection
 import com.snipsearch.extraction.OcrTiming
+import com.snipsearch.extraction.OcrWord
 import com.snipsearch.extraction.PixelRegion
 import com.snipsearch.extraction.isolated.OcrClientCoordinator
 import com.snipsearch.extraction.isolated.OcrScanSnapshot
@@ -136,7 +137,7 @@ internal fun OverlayScreen(
                         activeRunner.startScan(id, screenshot, timing)
                     }
                 }
-            } else {
+            } else if (crop.initialOcrLines == null) {
                 LaunchedEffect(crop) {
                     val id = activeRunner.nextScanId()
                     cropScanId = id
@@ -152,10 +153,15 @@ internal fun OverlayScreen(
             val activeScanId = if (crop != null) cropScanId else effectiveFullScanId
             val scanState by activeRunner.state.collectAsState()
             val matchesScan = activeScanId != 0L && scanState.scanId == activeScanId
-            val ocrLines = if (matchesScan) scanState.lines else emptyList()
-            val ocrComplete = matchesScan &&
-                (scanState.status == OcrScanSnapshot.Status.COMPLETE || scanState.status == OcrScanSnapshot.Status.FAILED)
-            val ocrFailed = matchesScan && scanState.status == OcrScanSnapshot.Status.FAILED
+            val useInitialCropLines = crop?.initialOcrLines != null && cropScanId == 0L
+            val ocrLines = when {
+                useInitialCropLines -> crop.initialOcrLines.orEmpty()
+                matchesScan -> scanState.lines
+                else -> emptyList()
+            }
+            val ocrComplete = useInitialCropLines || (matchesScan &&
+                (scanState.status == OcrScanSnapshot.Status.COMPLETE || scanState.status == OcrScanSnapshot.Status.FAILED))
+            val ocrFailed = !useInitialCropLines && matchesScan && scanState.status == OcrScanSnapshot.Status.FAILED
 
             val onRetryOcr = {
                 if (!source.isRecycled) {
@@ -228,11 +234,19 @@ internal fun OverlayScreen(
                                 }) { Text(stringResource(R.string.overlay_reselect)) }
                                 Button(onClick = {
                                     if (locked == null && !source.isRecycled) {
+                                        val fullReady = effectiveFullScanId != 0L &&
+                                            scanState.scanId == effectiveFullScanId &&
+                                            scanState.status == OcrScanSnapshot.Status.COMPLETE
+                                        val reusedLines = if (fullReady) {
+                                            cropOcrLines(scanState.lines, region).takeIf { it.isNotEmpty() }
+                                        } else {
+                                            null
+                                        }
                                         val bitmap = copyCrop(source, region)
                                         if (bitmap == null) {
                                             cropFailed = true
                                         } else {
-                                            locked = LockedCrop(bitmap, originalSize, region)
+                                            locked = LockedCrop(bitmap, originalSize, region, reusedLines)
                                             onScreenshotConsumed()
                                         }
                                     }
@@ -313,24 +327,29 @@ private fun BoxScope.TextSelection(
     }
 
     val lines = recognized
-    val options = remember(lines, assist, screenCrop) {
+    val resolvedOptions = remember(lines, assist, screenCrop) {
         when {
             lines == null -> null
             lines.isEmpty() -> TextOptions(assist, selectableWords(assist, screenCrop))
             else -> {
                 val corrected = OcrTextCorrection.correct(lines, assist)
                 val words = corrected.flatMapIndexed { lineIndex, line ->
-                    val bidi = Bidi(line.text, Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT)
+                    val bidi = if (hasPossibleRtl(line.text)) {
+                        Bidi(line.text, Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT)
+                    } else {
+                        null
+                    }
                     line.words.map { word ->
-                        SelectableWord(lineIndex, word.characters, word.bounds, bidi.getLevelAt(word.characters.first) % 2 != 0)
+                        val rtl = bidi != null && (bidi.getLevelAt(word.characters.first) % 2 != 0)
+                        SelectableWord(lineIndex, word.characters, word.bounds, rtl)
                     }
                 }
                 TextOptions(corrected.map { AssistTextBlock(it.text, it.bounds) }, words)
             }
         }
     }
-    LaunchedEffect(timing, options?.words?.isNotEmpty(), lines?.isNotEmpty()) {
-        val currentOptions = options ?: return@LaunchedEffect
+    LaunchedEffect(timing, resolvedOptions?.words?.isNotEmpty(), lines?.isNotEmpty()) {
+        val currentOptions = resolvedOptions ?: return@LaunchedEffect
         if (timing == null || currentOptions.words.isEmpty()) return@LaunchedEffect
         withFrameNanos { }
         val fromOcr = lines?.isNotEmpty() == true
@@ -340,17 +359,17 @@ private fun BoxScope.TextSelection(
             timing.logFirstOcrSelectableFrame("ocr_final", currentOptions.words.size)
         }
     }
-    var selection by remember(options?.words?.map { it.bounds }) { mutableStateOf<IntRange?>(null) }
-    val selected = if (options == null) "" else selectedText(options.blocks, options.words, selection)
+    var selection by remember(resolvedOptions?.words?.map { it.bounds }) { mutableStateOf<IntRange?>(null) }
+    val selected = if (resolvedOptions == null) "" else selectedText(resolvedOptions.blocks, resolvedOptions.words, selection)
     val entities = remember(codes, selected) { (codes + EntityAndQrDetector.extract(selected)).distinct() }
-    if (options?.words?.isNotEmpty() == true) {
-        SelectableTextLayer(options.words, viewport, screen, selection, { selection = it }, Modifier.fillMaxSize())
+    if (resolvedOptions?.words?.isNotEmpty() == true) {
+        SelectableTextLayer(resolvedOptions.words, viewport, screen, selection, { selection = it }, Modifier.fillMaxSize())
     }
     OverlayCard(Modifier.align(Alignment.BottomCenter)) {
         val message = when {
-            options == null -> R.string.overlay_running_ocr
-            ocrFailed && options.words.isEmpty() -> R.string.overlay_ocr_failed
-            options.words.isEmpty() -> R.string.overlay_no_text
+            resolvedOptions == null -> R.string.overlay_running_ocr
+            ocrFailed && resolvedOptions.words.isEmpty() -> R.string.overlay_ocr_failed
+            resolvedOptions.words.isEmpty() -> R.string.overlay_no_text
             else -> R.string.overlay_select_text
         }
         Row(Modifier.fillMaxWidth().padding(end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -494,7 +513,45 @@ private data class LockedCrop(
     val bitmap: Bitmap,
     val originalSize: IntSize,
     val region: PixelRegion,
+    val initialOcrLines: List<OcrLine>? = null,
 )
+
+private fun hasPossibleRtl(text: String): Boolean {
+    for (i in text.indices) {
+        if (text[i] >= '\u0590') return true
+    }
+    return false
+}
+
+internal fun cropOcrLines(lines: List<OcrLine>, region: PixelRegion): List<OcrLine> {
+    if (lines.isEmpty() || region.width <= 0 || region.height <= 0) return emptyList()
+    return lines.mapNotNull { line ->
+        val kept = line.words.mapNotNull { word ->
+            val bounds = word.bounds
+            val overlap = bounds.intersection(region) ?: return@mapNotNull null
+            val wordArea = bounds.width.toLong() * bounds.height
+            val overlapArea = overlap.width.toLong() * overlap.height
+            val centerX = (bounds.left + bounds.right) / 2
+            val centerY = (bounds.top + bounds.bottom) / 2
+            val centerInside = centerX in region.left until region.right &&
+                centerY in region.top until region.bottom
+            if (!centerInside && overlapArea * 2 < wordArea) return@mapNotNull null
+            val text = line.text.substring(word.characters)
+            text to overlap.translated(-region.left, -region.top)
+        }
+        if (kept.isEmpty()) return@mapNotNull null
+        val words = ArrayList<OcrWord>(kept.size)
+        val text = buildString {
+            kept.forEachIndexed { index, (wordText, translatedBounds) ->
+                if (index > 0) append(' ')
+                val start = length
+                append(wordText)
+                words += OcrWord(start until length, translatedBounds)
+            }
+        }
+        OcrLine(text, words)
+    }
+}
 
 private fun copyCrop(screenshot: Bitmap, region: PixelRegion): Bitmap? =
     screenshot.withSoftwarePixels { source ->

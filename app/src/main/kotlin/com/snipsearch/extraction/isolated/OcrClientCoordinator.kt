@@ -318,13 +318,20 @@ internal class OcrClientCoordinator(
             // setProtect only affects new mappings. The original mapping lets the owner
             // erase the pixels even though the service can only read them.
             pixels.clear()
-            while (pixels.hasRemaining()) pixels.put(0)
+            var remaining = pixels.capacity()
+            while (remaining > 0) {
+                val step = minOf(ZERO_INTS.size, remaining)
+                pixels.put(ZERO_INTS, 0, step)
+                remaining -= step
+            }
+            pixels.clear()
             SharedMemory.unmap(mapping)
             memory.close()
         }
 
         companion object {
-            private const val STRIP_ROWS = 128
+            private const val STRIP_ROWS = 256
+            private val ZERO_INTS = IntArray(4096)
 
             fun copy(crop: Bitmap, isCancelled: () -> Boolean = { false }): CropPixels? {
                 if (isCancelled() || crop.isRecycled) return null

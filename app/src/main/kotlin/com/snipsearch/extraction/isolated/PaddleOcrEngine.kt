@@ -11,9 +11,13 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.IntBuffer
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
@@ -24,9 +28,12 @@ import kotlin.math.roundToInt
 internal class PaddleOcrEngine private constructor(
     private val environment: OrtEnvironment,
     private val detector: OrtSession,
-    private val recognizers: Array<OrtSession>,
+    private val recPoolFuture: CompletableFuture<Array<OrtSession>>,
+    private val recInitThread: Thread,
+    private val initClosed: AtomicBoolean,
     private val decoder: CtcBeamDecoder,
     private val detScratch: DirectFloatScratch,
+    private val detRegionScratch: TextDetectorScratch,
     private val recScratches: Array<DirectFloatScratch>,
     private val recExecutor: ExecutorService,
 ) : AutoCloseable {
@@ -51,17 +58,18 @@ internal class PaddleOcrEngine private constructor(
             scratch = detScratch,
             width = detWidth,
             height = detHeight,
-            fill = { planar ->
-                fillDetectorInput(argb, width, height, stride, detWidth, detHeight, scaleX, scaleY, planar)
+            fill = { input, scratch ->
+                fillDetectorInput(argb, width, height, stride, detWidth, detHeight, scaleX, scaleY, input, scratch)
             },
         ) { shape, output, _, _ ->
             require(shape.contentEquals(longArrayOf(1, 1, detHeight.toLong(), detWidth.toLong())))
-            TextDetector.regions(output.floatBuffer!!, detWidth, detHeight)
+            TextDetector.regions(output.floatBuffer!!, detWidth, detHeight, detRegionScratch)
         }
         val detMs = (System.nanoTime() - detStartNanos) / 1_000_000L
         onDetected(regions.size, detMs)
         if (regions.isEmpty() || isCancelled()) return emptyList()
 
+        val recognizers = awaitRecognizers(isCancelled) ?: return emptyList()
         val results = arrayOfNulls<OcrTextBlockParcelable>(regions.size)
         if (regions.size == 1 || recognizers.size <= 1) {
             val image = CropImage(argb.duplicate(), width, height, stride)
@@ -112,6 +120,19 @@ internal class PaddleOcrEngine private constructor(
         return if (isCancelled()) emptyList() else results.filterNotNull()
     }
 
+    private fun awaitRecognizers(isCancelled: () -> Boolean): Array<OrtSession>? {
+        while (true) {
+            if (isCancelled()) return null
+            try {
+                return recPoolFuture.get(25, TimeUnit.MILLISECONDS)
+            } catch (_: java.util.concurrent.TimeoutException) {
+                // Keep checking cancellation while cold recognizer initialization finishes.
+            } catch (e: ExecutionException) {
+                throw e.cause ?: e
+            }
+        }
+    }
+
     private fun fillDetectorInput(
         argb: IntBuffer,
         width: Int,
@@ -121,7 +142,8 @@ internal class PaddleOcrEngine private constructor(
         detHeight: Int,
         scaleX: Double,
         scaleY: Double,
-        planar: FloatArray,
+        input: FloatBuffer,
+        scratch: DirectFloatScratch,
     ) {
         val plane = detWidth * detHeight
         val x0Table = IntArray(detWidth)
@@ -129,6 +151,9 @@ internal class PaddleOcrEngine private constructor(
         val wxTable = FloatArray(detWidth)
         val rowA = IntArray(width)
         val rowB = IntArray(width)
+        val rowBlue = scratch.rowBlue(detWidth)
+        val rowGreen = scratch.rowGreen(detWidth)
+        val rowRed = scratch.rowRed(detWidth)
         var rowAIndex = -1
         var rowBIndex = -1
         val argbView = argb.duplicate()
@@ -171,7 +196,6 @@ internal class PaddleOcrEngine private constructor(
                 val oneMinusWy = 1f - wy
                 val topRow = rowFor(y0, y1)
                 val bottomRow = rowFor(y1, y0)
-                val rowOffset = y * detWidth
                 for (x in 0 until detWidth) {
                     val x0 = x0Table[x]
                     val x1 = x1Table[x]
@@ -181,20 +205,26 @@ internal class PaddleOcrEngine private constructor(
                     val tr = topRow[x1]
                     val bl = bottomRow[x0]
                     val br = bottomRow[x1]
-                    val offset = rowOffset + x
 
                     val topB = (tl and 0xff) * oneMinusWx + (tr and 0xff) * wx
                     val botB = (bl and 0xff) * oneMinusWx + (br and 0xff) * wx
-                    planar[offset] = (topB * oneMinusWy + botB * wy) * scale0 + bias0
+                    rowBlue[x] = (topB * oneMinusWy + botB * wy) * scale0 + bias0
 
                     val topG = ((tl ushr 8) and 0xff) * oneMinusWx + ((tr ushr 8) and 0xff) * wx
                     val botG = ((bl ushr 8) and 0xff) * oneMinusWx + ((br ushr 8) and 0xff) * wx
-                    planar[plane + offset] = (topG * oneMinusWy + botG * wy) * scale1 + bias1
+                    rowGreen[x] = (topG * oneMinusWy + botG * wy) * scale1 + bias1
 
                     val topR = ((tl ushr 16) and 0xff) * oneMinusWx + ((tr ushr 16) and 0xff) * wx
                     val botR = ((bl ushr 16) and 0xff) * oneMinusWx + ((br ushr 16) and 0xff) * wx
-                    planar[2 * plane + offset] = (topR * oneMinusWy + botR * wy) * scale2 + bias2
+                    rowRed[x] = (topR * oneMinusWy + botR * wy) * scale2 + bias2
                 }
+                val rowOffset = y * detWidth
+                input.position(rowOffset)
+                input.put(rowBlue, 0, detWidth)
+                input.position(plane + rowOffset)
+                input.put(rowGreen, 0, detWidth)
+                input.position(2 * plane + rowOffset)
+                input.put(rowRed, 0, detWidth)
             }
         } finally {
             rowA.fill(0)
@@ -215,31 +245,21 @@ internal class PaddleOcrEngine private constructor(
     ): OcrTextBlockParcelable? {
         val height = 48
         val contentWidth = ceil(height * region.aspectRatio(scaleX, scaleY)).toInt().coerceIn(16, REC_MAX_WIDTH)
-        val width = (((contentWidth + 31) / 32) * 32).coerceAtLeast(32)
+        // PP-OCRv6_tiny_rec has exact horizontal stride 8 (3x stride-2 downsamples).
+        val width = (((contentWidth + 7) / 8) * 8).coerceAtLeast(16)
         return infer(
             session = session,
             scratch = scratch,
             width = width,
             height = height,
-            fill = { planar ->
-                val plane = width * height
+            fill = { input, rowScratch ->
                 if (abs(region.dy) < 1e-6) {
-                    fillHorizontalRecognizerInput(image, region, scaleX, scaleY, contentWidth, width, height, planar)
+                    fillHorizontalRecognizerInput(image, region, scaleX, scaleY, contentWidth, width, height, input, rowScratch)
                 } else {
-                    for (y in 0 until height) {
-                        val vertical = (y + 0.5) / height
-                        for (x in 0 until contentWidth) {
-                            val horizontal = (x + 0.5) / contentWidth
-                            image.sample(
-                                planar, y * width + x, plane,
-                                region.x(horizontal, vertical) * scaleX,
-                                region.y(horizontal, vertical) * scaleY,
-                            )
-                        }
-                    }
+                    fillAngledRecognizerInput(image, region, scaleX, scaleY, contentWidth, width, height, input, rowScratch)
                 }
             },
-        ) { shape, output, tokenOutput, planar ->
+        ) { shape, output, tokenOutput, inputBuffer ->
             val steps = shape[1].toInt()
             require(shape.contentEquals(longArrayOf(1, steps.toLong())) && output.type == OnnxJavaType.FLOAT)
             val ids = tokenOutput ?: error("Recognizer token output is missing")
@@ -252,6 +272,10 @@ internal class PaddleOcrEngine private constructor(
                 decodedWords, width.toDouble() / (contentWidth * steps) * region.aspectRatio(scaleX, scaleY),
             )
             if (words.isEmpty()) return@infer null
+            val floatCount = 3 * width * height
+            val planar = scratch.planarArray(floatCount)
+            inputBuffer.position(0)
+            inputBuffer.get(planar, 0, floatCount)
             val refinedSpans = WordBoundsRefiner.refine(planar, width, contentWidth, height, steps, words)
             val starts = IntArray(words.size)
             val ends = IntArray(words.size)
@@ -296,7 +320,8 @@ internal class PaddleOcrEngine private constructor(
         contentWidth: Int,
         width: Int,
         height: Int,
-        planar: FloatArray,
+        input: FloatBuffer,
+        scratch: DirectFloatScratch,
     ) {
         val plane = width * height
         val x0Table = IntArray(contentWidth)
@@ -317,6 +342,9 @@ internal class PaddleOcrEngine private constructor(
         val spanWidth = maxSrcX - minSrcX + 1
         val rowA = IntArray(spanWidth)
         val rowB = IntArray(spanWidth)
+        val rowBlue = scratch.rowBlue(width).also { if (contentWidth < width) it.fill(0f, contentWidth, width) }
+        val rowGreen = scratch.rowGreen(width).also { if (contentWidth < width) it.fill(0f, contentWidth, width) }
+        val rowRed = scratch.rowRed(width).also { if (contentWidth < width) it.fill(0f, contentWidth, width) }
         var rowAIndex = -1
         var rowBIndex = -1
         try {
@@ -342,7 +370,6 @@ internal class PaddleOcrEngine private constructor(
                 val oneMinusWy = 1f - wy
                 val topRow = rowFor(y0, y1)
                 val bottomRow = rowFor(y1, y0)
-                val rowOffset = y * width
                 for (x in 0 until contentWidth) {
                     val lx0 = x0Table[x] - minSrcX
                     val lx1 = x1Table[x] - minSrcX
@@ -352,20 +379,26 @@ internal class PaddleOcrEngine private constructor(
                     val tr = topRow[lx1]
                     val bl = bottomRow[lx0]
                     val br = bottomRow[lx1]
-                    val offset = rowOffset + x
 
                     val topB = (tl and 0xff) * oneMinusWx + (tr and 0xff) * wx
                     val botB = (bl and 0xff) * oneMinusWx + (br and 0xff) * wx
-                    planar[offset] = (topB * oneMinusWy + botB * wy) * REC_SCALE + REC_BIAS
+                    rowBlue[x] = (topB * oneMinusWy + botB * wy) * REC_SCALE + REC_BIAS
 
                     val topG = ((tl ushr 8) and 0xff) * oneMinusWx + ((tr ushr 8) and 0xff) * wx
                     val botG = ((bl ushr 8) and 0xff) * oneMinusWx + ((br ushr 8) and 0xff) * wx
-                    planar[plane + offset] = (topG * oneMinusWy + botG * wy) * REC_SCALE + REC_BIAS
+                    rowGreen[x] = (topG * oneMinusWy + botG * wy) * REC_SCALE + REC_BIAS
 
                     val topR = ((tl ushr 16) and 0xff) * oneMinusWx + ((tr ushr 16) and 0xff) * wx
                     val botR = ((bl ushr 16) and 0xff) * oneMinusWx + ((br ushr 16) and 0xff) * wx
-                    planar[2 * plane + offset] = (topR * oneMinusWy + botR * wy) * REC_SCALE + REC_BIAS
+                    rowRed[x] = (topR * oneMinusWy + botR * wy) * REC_SCALE + REC_BIAS
                 }
+                val rowOffset = y * width
+                input.position(rowOffset)
+                input.put(rowBlue, 0, width)
+                input.position(plane + rowOffset)
+                input.put(rowGreen, 0, width)
+                input.position(2 * plane + rowOffset)
+                input.put(rowRed, 0, width)
             }
         } finally {
             rowA.fill(0)
@@ -376,21 +409,55 @@ internal class PaddleOcrEngine private constructor(
         }
     }
 
+    private fun fillAngledRecognizerInput(
+        image: CropImage,
+        region: TextRegion,
+        scaleX: Double,
+        scaleY: Double,
+        contentWidth: Int,
+        width: Int,
+        height: Int,
+        input: FloatBuffer,
+        scratch: DirectFloatScratch,
+    ) {
+        val plane = width * height
+        val rowBlue = scratch.rowBlue(width).also { if (contentWidth < width) it.fill(0f, contentWidth, width) }
+        val rowGreen = scratch.rowGreen(width).also { if (contentWidth < width) it.fill(0f, contentWidth, width) }
+        val rowRed = scratch.rowRed(width).also { if (contentWidth < width) it.fill(0f, contentWidth, width) }
+        for (y in 0 until height) {
+            val vertical = (y + 0.5) / height
+            for (x in 0 until contentWidth) {
+                val horizontal = (x + 0.5) / contentWidth
+                image.sampleRgbToRows(
+                    rowBlue, rowGreen, rowRed, x,
+                    region.x(horizontal, vertical) * scaleX,
+                    region.y(horizontal, vertical) * scaleY,
+                )
+            }
+            val rowOffset = y * width
+            input.position(rowOffset)
+            input.put(rowBlue, 0, width)
+            input.position(plane + rowOffset)
+            input.put(rowGreen, 0, width)
+            input.position(2 * plane + rowOffset)
+            input.put(rowRed, 0, width)
+        }
+    }
+
     private fun <T> infer(
         session: OrtSession,
         scratch: DirectFloatScratch,
         width: Int,
         height: Int,
-        fill: (FloatArray) -> Unit,
-        read: (LongArray, InferenceOutput, InferenceOutput?, FloatArray) -> T,
+        fill: (FloatBuffer, DirectFloatScratch) -> Unit,
+        read: (LongArray, InferenceOutput, InferenceOutput?, FloatBuffer) -> T,
     ): T {
         val floatCount = 3 * width * height
-        val planar = scratch.planarArray(floatCount)
         val input = scratch.floatBuffer(floatCount)
         try {
-            fill(planar)
-            input.put(planar, 0, floatCount)
-            input.rewind()
+            fill(input, scratch)
+            input.clear()
+            input.limit(floatCount)
             val shape = longArrayOf(1, 3, height.toLong(), width.toLong())
             OnnxTensor.createTensor(environment, input, shape).use { tensor ->
                 session.run(mapOf(session.inputNames.single() to tensor)).use { result ->
@@ -398,6 +465,9 @@ internal class PaddleOcrEngine private constructor(
                     val auxiliary = if (result.size() > 1) result[1] as OnnxTensor else null
                     inferenceOutput(output).use { outputData ->
                         auxiliary?.let(::inferenceOutput).use { auxiliaryData ->
+                            val planar = input.duplicate()
+                            planar.clear()
+                            planar.limit(floatCount)
                             return read(output.info.shape, outputData, auxiliaryData, planar)
                         }
                     }
@@ -415,15 +485,20 @@ internal class PaddleOcrEngine private constructor(
     )
 
     override fun close() {
+        initClosed.set(true)
+        runCatching { recInitThread.join() }
         recExecutor.shutdownNow()
+        detRegionScratch.scrub()
         detScratch.scrub()
         recScratches.forEach { it.scrub() }
         var firstFailure: Throwable? = null
-        for (rec in recognizers) {
-            try {
-                rec.close()
-            } catch (t: Throwable) {
-                if (firstFailure == null) firstFailure = t
+        if (recPoolFuture.isDone && !recPoolFuture.isCancelled && !recPoolFuture.isCompletedExceptionally) {
+            for (rec in recPoolFuture.get()) {
+                try {
+                    rec.close()
+                } catch (t: Throwable) {
+                    if (firstFailure == null) firstFailure = t
+                }
             }
         }
         try {
@@ -486,37 +561,72 @@ internal class PaddleOcrEngine private constructor(
             val recExecutor = Executors.newFixedThreadPool(workers) { runnable ->
                 Thread(runnable, "snip-ocr-rec").apply { isDaemon = true }
             }
+            val initClosed = AtomicBoolean(false)
+            val recPoolFuture = CompletableFuture<Array<OrtSession>>()
             var detSession: OrtSession? = null
-            val recSessions = mutableListOf<OrtSession>()
             try {
-                val (openedDet, detXnnpack) = openSession(environment, detBytes, intraThreads = workers)
+                val (openedDet, detXnnpack) = try {
+                    openSession(environment, detBytes, intraThreads = workers)
+                } finally {
+                    detBytes.fill(0)
+                }
                 detSession = openedDet
-                var recXnnpack = true
-                repeat(workers) {
-                    val (openedRec, active) = openSession(environment, recBytes, intraThreads = 1)
-                    recSessions += openedRec
-                    recXnnpack = recXnnpack && active
+
+                val recSessions = mutableListOf<OrtSession>()
+                val recInitThread = Thread({
+                    try {
+                        var recXnnpack = true
+                        repeat(workers) {
+                            if (initClosed.get()) {
+                                recSessions.forEach { runCatching { it.close() } }
+                                recSessions.clear()
+                                recPoolFuture.cancel(false)
+                                return@Thread
+                            }
+                            val (openedRec, active) = openSession(environment, recBytes, intraThreads = 1)
+                            recSessions += openedRec
+                            recXnnpack = recXnnpack && active
+                        }
+                        if (initClosed.get()) {
+                            recSessions.forEach { runCatching { it.close() } }
+                            recSessions.clear()
+                            recPoolFuture.cancel(false)
+                        } else {
+                            runCatching {
+                                Log.i(TAG, "opened workers=$workers xnnpack=det:$detXnnpack/rec:$recXnnpack")
+                            }
+                            recPoolFuture.complete(recSessions.toTypedArray())
+                        }
+                    } catch (failure: Throwable) {
+                        recSessions.forEach { runCatching { it.close() } }
+                        recSessions.clear()
+                        recPoolFuture.completeExceptionally(failure)
+                    } finally {
+                        recBytes.fill(0)
+                    }
+                }, "snip-ocr-rec-init").apply {
+                    isDaemon = true
+                    start()
                 }
-                runCatching {
-                    Log.i(TAG, "opened workers=$workers xnnpack=det:$detXnnpack/rec:$recXnnpack")
-                }
+
                 return PaddleOcrEngine(
                     environment = environment,
                     detector = openedDet,
-                    recognizers = recSessions.toTypedArray(),
+                    recPoolFuture = recPoolFuture,
+                    recInitThread = recInitThread,
+                    initClosed = initClosed,
                     decoder = CtcBeamDecoder(alphabet + " "),
                     detScratch = DirectFloatScratch(),
+                    detRegionScratch = TextDetectorScratch(),
                     recScratches = Array(workers) { DirectFloatScratch() },
                     recExecutor = recExecutor,
                 )
             } catch (failure: Throwable) {
+                initClosed.set(true)
+                recBytes.fill(0)
                 recExecutor.shutdownNow()
-                recSessions.forEach { runCatching { it.close() } }
                 detSession?.let { runCatching { it.close() } }
                 throw failure
-            } finally {
-                detBytes.fill(0)
-                recBytes.fill(0)
             }
         }
 
@@ -552,6 +662,9 @@ internal class PaddleOcrEngine private constructor(
                 options.setCPUArenaAllocator(true)
                 options.setInterOpNumThreads(1)
                 options.addConfigEntry("session.intra_op.allow_spinning", "0")
+                options.addConfigEntry("session.use_env_allocators", "1")
+                options.addConfigEntry("optimization.enable_gelu_approximation", "1")
+                options.addConfigEntry("mlas.enable_gemm_fastmath_arm64_bfloat16", "1")
                 options.setIntraOpNumThreads(intraThreads)
                 val xnnpackActive = if (useXnnpack) {
                     try {
@@ -593,6 +706,9 @@ internal data class InferenceOutput(
 internal class DirectFloatScratch {
     private var floatBuffer: FloatBuffer? = null
     private var planar: FloatArray = FloatArray(0)
+    private var rowBlue: FloatArray = FloatArray(0)
+    private var rowGreen: FloatArray = FloatArray(0)
+    private var rowRed: FloatArray = FloatArray(0)
 
     fun floatBuffer(floatCount: Int): FloatBuffer {
         val current = floatBuffer
@@ -617,12 +733,43 @@ internal class DirectFloatScratch {
         return planar
     }
 
-    fun scrub(usedFloats: Int? = null) {
-        if (planar.isNotEmpty()) {
-            val limit = minOf(usedFloats ?: planar.size, planar.size)
-            planar.fill(0f, 0, limit)
+    fun rowBlue(width: Int): FloatArray {
+        if (rowBlue.size < width) {
+            rowBlue.fill(0f)
+            rowBlue = FloatArray(width)
         }
+        return rowBlue
+    }
+
+    fun rowGreen(width: Int): FloatArray {
+        if (rowGreen.size < width) {
+            rowGreen.fill(0f)
+            rowGreen = FloatArray(width)
+        }
+        return rowGreen
+    }
+
+    fun rowRed(width: Int): FloatArray {
+        if (rowRed.size < width) {
+            rowRed.fill(0f)
+            rowRed = FloatArray(width)
+        }
+        return rowRed
+    }
+
+    fun scrub(usedFloats: Int? = null, usedRowWidth: Int? = null) {
+        scrubRow(rowBlue, usedRowWidth)
+        scrubRow(rowGreen, usedRowWidth)
+        scrubRow(rowRed, usedRowWidth)
+        scrubRow(planar, usedFloats)
         zeroFloatBuffer(floatBuffer, usedFloats)
+    }
+
+    private fun scrubRow(row: FloatArray, usedRowWidth: Int?) {
+        if (row.isNotEmpty()) {
+            val limit = minOf(usedRowWidth ?: row.size, row.size)
+            row.fill(0f, 0, limit)
+        }
     }
 
     private fun zeroFloatBuffer(buffer: FloatBuffer?, usedFloats: Int? = null) {
@@ -642,7 +789,14 @@ private class CropImage(
         argb.get(dest, 0, count)
     }
 
-    fun sample(tensor: FloatArray, offset: Int, plane: Int, x: Double, y: Double) {
+    fun sampleRgbToRows(
+        rowBlue: FloatArray,
+        rowGreen: FloatArray,
+        rowRed: FloatArray,
+        xIndex: Int,
+        x: Double,
+        y: Double,
+    ) {
         val sx = (x - 0.5).coerceIn(0.0, width - 1.0)
         val sy = (y - 0.5).coerceIn(0.0, height - 1.0)
         val x0 = floor(sx).toInt()
@@ -657,13 +811,17 @@ private class CropImage(
         val topRight = argb[y0 * stride + x1]
         val bottomLeft = argb[y1 * stride + x0]
         val bottomRight = argb[y1 * stride + x1]
-        for (channel in 0..2) {
-            // PaddleOCR's OpenCV pipeline feeds BGR channel planes.
-            val shift = 8 * channel
-            val top = ((topLeft ushr shift) and 0xff) * oneMinusWx + ((topRight ushr shift) and 0xff) * wx
-            val bottom = ((bottomLeft ushr shift) and 0xff) * oneMinusWx + ((bottomRight ushr shift) and 0xff) * wx
-            val value = top * oneMinusWy + bottom * wy
-            tensor[channel * plane + offset] = value * (1f / (255f * 0.5f)) - 1f
-        }
+
+        val topB = (topLeft and 0xff) * oneMinusWx + (topRight and 0xff) * wx
+        val botB = (bottomLeft and 0xff) * oneMinusWx + (bottomRight and 0xff) * wx
+        rowBlue[xIndex] = (topB * oneMinusWy + botB * wy) * (1f / (255f * 0.5f)) - 1f
+
+        val topG = ((topLeft ushr 8) and 0xff) * oneMinusWx + ((topRight ushr 8) and 0xff) * wx
+        val botG = ((bottomLeft ushr 8) and 0xff) * oneMinusWx + ((bottomRight ushr 8) and 0xff) * wx
+        rowGreen[xIndex] = (topG * oneMinusWy + botG * wy) * (1f / (255f * 0.5f)) - 1f
+
+        val topR = ((topLeft ushr 16) and 0xff) * oneMinusWx + ((topRight ushr 16) and 0xff) * wx
+        val botR = ((bottomLeft ushr 16) and 0xff) * oneMinusWx + ((bottomRight ushr 16) and 0xff) * wx
+        rowRed[xIndex] = (topR * oneMinusWy + botR * wy) * (1f / (255f * 0.5f)) - 1f
     }
 }

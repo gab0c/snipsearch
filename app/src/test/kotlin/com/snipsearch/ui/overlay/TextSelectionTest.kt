@@ -3,6 +3,8 @@ package com.snipsearch.ui.overlay
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import com.snipsearch.extraction.AssistTextBlock
+import com.snipsearch.extraction.OcrLine
+import com.snipsearch.extraction.OcrWord
 import com.snipsearch.extraction.PixelRegion
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -77,5 +79,28 @@ class TextSelectionTest {
             ),
             merged,
         )
+    }
+
+    @Test
+    fun cropOcrLinesKeepsIntersectingWordsAndTranslatesClampedBounds() {
+        val lines = listOf(
+            OcrLine(
+                "Hello world wide",
+                listOf(
+                    OcrWord(0..4, PixelRegion(10, 20, 60, 40)),
+                    OcrWord(6..10, PixelRegion(70, 20, 120, 40)),
+                    OcrWord(12..15, PixelRegion(130, 20, 180, 40)),
+                ),
+            ),
+            OcrLine(
+                "Outside line",
+                listOf(OcrWord(0..6, PixelRegion(10, 100, 80, 120))),
+            ),
+        )
+        val cropped = cropOcrLines(lines, PixelRegion(50, 15, 140, 60))
+        assertEquals(1, cropped.size)
+        assertEquals("world", cropped.single().text)
+        assertEquals(0..4, cropped.single().words.single().characters)
+        assertEquals(PixelRegion(20, 5, 70, 25), cropped.single().words.single().bounds)
     }
 }

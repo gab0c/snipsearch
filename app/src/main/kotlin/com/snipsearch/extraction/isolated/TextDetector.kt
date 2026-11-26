@@ -21,17 +21,23 @@ internal object TextDetector {
     private const val HORIZONTAL_SNAP_SIN = 0.045
     private const val COMPACT_ANGLE_RATIO = 1.8
 
-    fun regions(map: FloatBuffer, width: Int, height: Int): List<TextRegion> {
+    fun regions(
+        map: FloatBuffer,
+        width: Int,
+        height: Int,
+        scratch: TextDetectorScratch? = null,
+    ): List<TextRegion> {
         val totalPixels = width * height
-        val probs = FloatArray(totalPixels)
-        val seen = BooleanArray(totalPixels)
-        val queue = IntArray(totalPixels)
+        val activeScratch = scratch ?: TextDetectorScratch()
+        val probs = activeScratch.probsArray(totalPixels)
+        val seen = activeScratch.seenArray(totalPixels)
+        val queue = activeScratch.queueArray(totalPixels)
         val regions = mutableListOf<TextRegion>()
         try {
             val view = map.duplicate()
             view.position(0)
-            view.get(probs)
-            for (start in probs.indices) {
+            view.get(probs, 0, totalPixels)
+            for (start in 0 until totalPixels) {
                 if (seen[start] || probs[start] < PIXEL_THRESH) continue
                 var head = 0
                 var tail = 1
@@ -49,26 +55,35 @@ internal object TextDetector {
                 var maxY = -1
                 while (head < tail) {
                     val index = queue[head++]
-                    val x = index % width
                     val y = index / width
+                    val x = index - y * width
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
                     total += probs[index]
                     sumX += x
                     sumY += y
                     sumXX += x.toDouble() * x
                     sumYY += y.toDouble() * y
                     sumXY += x.toDouble() * y
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
-                    for (ny in maxOf(0, y - 1)..minOf(height - 1, y + 1)) {
-                        for (nx in maxOf(0, x - 1)..minOf(width - 1, x + 1)) {
-                            val neighbor = ny * width + nx
+                    val yMin = if (y > 0) y - 1 else 0
+                    val yMax = if (y + 1 < height) y + 1 else height - 1
+                    val xMin = if (x > 0) x - 1 else 0
+                    val xMax = if (x + 1 < width) x + 1 else width - 1
+                    var ny = yMin
+                    while (ny <= yMax) {
+                        val rowOffset = ny * width
+                        var nx = xMin
+                        while (nx <= xMax) {
+                            val neighbor = rowOffset + nx
                             if (!seen[neighbor] && probs[neighbor] >= PIXEL_THRESH) {
                                 seen[neighbor] = true
                                 queue[tail++] = neighbor
                             }
+                            nx++
                         }
+                        ny++
                     }
                 }
                 if (tail < 6 || total / tail < REGION_SCORE_THRESH) continue
@@ -92,8 +107,10 @@ internal object TextDetector {
                     bottom = maxY + 0.5
                 } else {
                     for (i in 0 until tail) {
-                        val x = queue[i] % width + 0.5
-                        val y = queue[i] / width + 0.5
+                        val py = queue[i] / width
+                        val px = queue[i] - py * width
+                        val x = px + 0.5
+                        val y = py + 0.5
                         val u = x * dx + y * dy
                         val v = y * dx - x * dy
                         left = minOf(left, u)
@@ -123,9 +140,49 @@ internal object TextDetector {
             }
             return regions.sortedWith(compareBy({ it.y(0.5, 0.5) }, { it.x(0.5, 0.5) })).take(96)
         } finally {
+            activeScratch.scrub(totalPixels)
+        }
+    }
+}
+
+internal class TextDetectorScratch {
+    private var probs = FloatArray(0)
+    private var seen = BooleanArray(0)
+    private var queue = IntArray(0)
+
+    fun probsArray(size: Int): FloatArray {
+        if (probs.size < size) {
             probs.fill(0f)
-            queue.fill(0)
+            probs = FloatArray(size)
+        }
+        return probs
+    }
+
+    fun seenArray(size: Int): BooleanArray {
+        if (seen.size < size) {
             seen.fill(false)
+            seen = BooleanArray(size)
+        }
+        return seen
+    }
+
+    fun queueArray(size: Int): IntArray {
+        if (queue.size < size) {
+            queue.fill(0)
+            queue = IntArray(size)
+        }
+        return queue
+    }
+
+    fun scrub(usedPixels: Int? = null) {
+        if (probs.isNotEmpty()) {
+            probs.fill(0f, 0, minOf(usedPixels ?: probs.size, probs.size))
+        }
+        if (seen.isNotEmpty()) {
+            seen.fill(false, 0, minOf(usedPixels ?: seen.size, seen.size))
+        }
+        if (queue.isNotEmpty()) {
+            queue.fill(0, 0, minOf(usedPixels ?: queue.size, queue.size))
         }
     }
 }
