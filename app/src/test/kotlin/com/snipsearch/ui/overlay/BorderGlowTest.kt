@@ -4,6 +4,7 @@ import androidx.compose.ui.geometry.Offset
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.min
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -16,7 +17,17 @@ class BorderGlowTest {
 
     @Test
     fun traceLapDurationIsSlowAndDeliberate() {
-        assertTrue("lap should be at least 4000ms, was $COMET_LAP_MILLIS", COMET_LAP_MILLIS >= 4000L)
+        assertTrue("lap should be between 3000ms and 4200ms, was $COMET_LAP_MILLIS", COMET_LAP_MILLIS in 3000L..4200L)
+    }
+
+    @Test
+    fun mergeDurationIsQuickAcrossGapSizes() {
+        val fullTailGap = traceMergeGapLap()
+        val afterFullTail = mergeDurationMillis(fullTailGap)
+        val afterInstantOcr = mergeDurationMillis(0.5f)
+        assertTrue("full-tail merge should be 160..200ms, was $afterFullTail", afterFullTail in 160L..200L)
+        assertTrue("instant-OCR merge should be 220..260ms, was $afterInstantOcr", afterInstantOcr in 220L..260L)
+        assertTrue(afterFullTail <= afterInstantOcr)
     }
 
     @Test
@@ -155,26 +166,33 @@ class BorderGlowTest {
     @Test
     fun traceProfileFeathersLeadAndDecaysSmoothly() {
         val tailSpan = traceTailLapSpan()
-        val leadLap = TRACE_LEAD_FRACTION * tailSpan
-        assertEquals(0f, traceProfile(0f, tailSpan).alphaScale, 1e-6f)
-        assertEquals(0f, traceProfile(tailSpan, tailSpan).alphaScale, 1e-6f)
+        for (drawn in listOf(tailSpan, 0.08f)) {
+            val leadLap = min(TRACE_LEAD_FRACTION * tailSpan, drawn * 0.40f)
+            assertEquals(0f, traceProfile(0f, drawn, tailSpan).alphaScale, 1e-6f)
+            assertEquals(0f, traceProfile(drawn, drawn, tailSpan).alphaScale, 1e-6f)
 
-        var prevAlpha = -1f
-        for (i in 0..20) {
-            val back = leadLap * i / 20f
-            val sample = traceProfile(back, tailSpan)
-            assertTrue("lead alpha must rise at $back", sample.alphaScale >= prevAlpha)
-            assertTrue("width out of range at $back: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
-            prevAlpha = sample.alphaScale
-        }
+            val beforeLead = traceProfile(leadLap - 1e-5f, drawn, tailSpan)
+            val afterLead = traceProfile(leadLap + 1e-5f, drawn, tailSpan)
+            assertEquals(beforeLead.alphaScale, afterLead.alphaScale, 1e-3f)
+            assertEquals(beforeLead.widthScale, afterLead.widthScale, 1e-3f)
 
-        prevAlpha = Float.MAX_VALUE
-        for (i in 0..80) {
-            val back = leadLap + (tailSpan - leadLap) * i / 80f
-            val sample = traceProfile(back, tailSpan)
-            assertTrue("tail alpha must decay at $back", sample.alphaScale <= prevAlpha)
-            assertTrue("width out of range at $back: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
-            prevAlpha = sample.alphaScale
+            var prevAlpha = -1f
+            for (i in 0..20) {
+                val back = leadLap * i / 20f
+                val sample = traceProfile(back, drawn, tailSpan)
+                assertTrue("lead alpha must rise for drawn=$drawn at $back", sample.alphaScale >= prevAlpha - 1e-6f)
+                assertTrue("width out of range at $back: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
+                prevAlpha = sample.alphaScale
+            }
+
+            prevAlpha = Float.MAX_VALUE
+            for (i in 0..80) {
+                val back = leadLap + (drawn - leadLap) * i / 80f
+                val sample = traceProfile(back, drawn, tailSpan)
+                assertTrue("tail alpha must decay for drawn=$drawn at $back", sample.alphaScale <= prevAlpha + 1e-6f)
+                assertTrue("width out of range at $back: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
+                prevAlpha = sample.alphaScale
+            }
         }
     }
 
@@ -199,30 +217,61 @@ class BorderGlowTest {
     @Test
     fun mergeRemovesTailDecayAndGrowsTailToFullBorder() {
         val tailSpan = traceTailLapSpan()
-        val gapLap = traceMergeGapLap()
-        val leadLap = TRACE_LEAD_FRACTION * tailSpan
 
-        val extraMid = gapLap * 0.5f
-        val sweptSample = traceProfile(leadLap + extraMid * 0.5f, tailSpan, extraMid, mergeProgress = 0.5f)
-        assertEquals(1f, sweptSample.widthScale, 1e-6f)
-        assertEquals(1.06f, sweptSample.alphaScale, 1e-4f)
+        for (drawn in listOf(tailSpan, 0.10f)) {
+            val gap = (1f / COMET_COUNT) - drawn
+            val extraMid = gap * 0.5f
+            val arcMid = drawn + extraMid
+            val leadLap = min(TRACE_LEAD_FRACTION * tailSpan, arcMid * 0.40f)
 
-        val beforeLead = traceProfile(leadLap - 1e-5f, tailSpan, extraMid, mergeProgress = 0.5f)
-        val afterLead = traceProfile(leadLap + 1e-5f, tailSpan, extraMid, mergeProgress = 0.5f)
-        assertEquals(beforeLead.alphaScale, afterLead.alphaScale, 1e-3f)
-        assertEquals(beforeLead.widthScale, afterLead.widthScale, 1e-3f)
+            // No blunt cut-off wall at the anchored tail end while gap is still open (p = 0.5).
+            assertEquals(
+                "anchored tail end must feather to 0 during mid-merge for drawn=$drawn",
+                0f,
+                traceProfile(arcMid, drawn, tailSpan, extraMid, mergeProgress = 0.5f).alphaScale,
+                1e-6f,
+            )
 
-        val tailEndLoading = traceProfile(tailSpan, tailSpan, 0f, mergeProgress = 0f)
-        val tailEndMerging = traceProfile(tailSpan + extraMid, tailSpan, extraMid, mergeProgress = 0.5f)
-        assertTrue("tail end alpha should grow: ${tailEndMerging.alphaScale} vs ${tailEndLoading.alphaScale}", tailEndMerging.alphaScale > 0.45f)
-        assertEquals(0.75f, tailEndMerging.widthScale, 1e-4f)
+            // Newly swept zone behind the leading nose stays at full width with zero tail decay.
+            val sweptSample = traceProfile(leadLap + extraMid * 0.5f, drawn, tailSpan, extraMid, mergeProgress = 0.5f)
+            assertEquals(1f, sweptSample.widthScale, 1e-6f)
+            assertEquals(1.06f, sweptSample.alphaScale, 1e-4f)
 
-        val fullSpan = tailSpan + gapLap
-        for (i in 0..50) {
-            val back = fullSpan * i / 50f
-            val settled = traceProfile(back, tailSpan, gapLap, mergeProgress = 1f)
-            assertEquals("alpha at $back", 1f, settled.alphaScale, 1e-5f)
-            assertEquals("width at $back", 1f, settled.widthScale, 1e-5f)
+            // Continuity across the leading-nose boundary.
+            val beforeLead = traceProfile(leadLap - 1e-5f, drawn, tailSpan, extraMid, mergeProgress = 0.5f)
+            val afterLead = traceProfile(leadLap + 1e-5f, drawn, tailSpan, extraMid, mergeProgress = 0.5f)
+            assertEquals(beforeLead.alphaScale, afterLead.alphaScale, 1e-3f)
+            assertEquals(beforeLead.widthScale, afterLead.widthScale, 1e-3f)
+
+            // Interior of the older tail grows thicker and brighter proportional to p.
+            val olderMidOffset = (drawn - leadLap) * 0.5f
+            val interiorLoading = traceProfile(leadLap + olderMidOffset, drawn, tailSpan, 0f, mergeProgress = 0f)
+            val interiorMerging = traceProfile(leadLap + extraMid + olderMidOffset, drawn, tailSpan, extraMid, mergeProgress = 0.5f)
+            assertTrue(
+                "tail interior alpha should grow for drawn=$drawn: ${interiorMerging.alphaScale} vs ${interiorLoading.alphaScale}",
+                interiorMerging.alphaScale > interiorLoading.alphaScale,
+            )
+            assertTrue(
+                "tail interior width should grow for drawn=$drawn: ${interiorMerging.widthScale} vs ${interiorLoading.widthScale}",
+                interiorMerging.widthScale > interiorLoading.widthScale,
+            )
+
+            // Settled at p = 1: full uniform border everywhere.
+            val fullSpan = drawn + gap
+            for (i in 0..50) {
+                val back = fullSpan * i / 50f
+                val settled = traceProfile(back, drawn, tailSpan, gap, mergeProgress = 1f)
+                assertEquals("alpha at $back (drawn=$drawn)", 1f, settled.alphaScale, 1e-5f)
+                assertEquals("width at $back (drawn=$drawn)", 1f, settled.widthScale, 1e-5f)
+            }
+        }
+
+        // Edge case: OCR completed at frame 0 (drawn = 0f, full 0.5 lap sweep at p = 1f).
+        for (i in 0..25) {
+            val back = 0.5f * i / 25f
+            val settled = traceProfile(back, 0f, tailSpan, 0.5f, mergeProgress = 1f)
+            assertEquals(1f, settled.alphaScale, 1e-5f)
+            assertEquals(1f, settled.widthScale, 1e-5f)
         }
     }
 
