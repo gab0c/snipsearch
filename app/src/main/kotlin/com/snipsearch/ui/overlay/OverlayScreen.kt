@@ -41,8 +41,11 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -166,6 +169,9 @@ internal fun OverlayScreen(
                 }
             }
 
+            val textMode = crop != null || !imageMode
+            val ocrLoading = textMode && !ocrComplete
+
             ImageViewport(source, originalSize, activeRegion, Modifier.fillMaxSize()) { viewport ->
                 if (crop != null) {
                     val cropPixels = PixelRegion(0, 0, crop.region.width, crop.region.height)
@@ -189,7 +195,6 @@ internal fun OverlayScreen(
                     val region = imageSelection
                     val codes = if (region != null) rememberCodes(source, region, region) else null
                     if (region == null) {
-                        Canvas(Modifier.fillMaxSize()) { drawRect(Color.Black.copy(alpha = 0.21f)) }
                         GestureLassoCanvas(viewport, { imageSelection = it }, Modifier.fillMaxSize())
                     } else {
                         AdjustableCropBox(region, viewport, { imageSelection = it }, Modifier.fillMaxSize())
@@ -254,6 +259,7 @@ internal fun OverlayScreen(
                     )
                 }
             }
+            BorderGlow(ocrLoading, Modifier.fillMaxSize())
         }
         Surface(
             modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(12.dp),
@@ -370,6 +376,7 @@ private fun OverlayCard(modifier: Modifier = Modifier, content: @Composable () -
             Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.large,
             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
+            contentColor = MaterialTheme.colorScheme.onSurface,
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) { content() }
         }
@@ -453,11 +460,35 @@ private fun ImageViewport(
                         destination.height.roundToInt().coerceAtLeast(1),
                     ),
                 )
+                val minDim = minOf(this.size.width, this.size.height)
+                if (minDim > 0f) {
+                    val scaleX = if (this.size.width >= this.size.height) this.size.width / minDim else 1f
+                    val scaleY = if (this.size.height > this.size.width) this.size.height / minDim else 1f
+                    val brush = Brush.radialGradient(
+                        0.00f to Color.Black.copy(alpha = DIM_CENTER_ALPHA),
+                        0.45f to Color.Black.copy(alpha = DIM_MID_ALPHA),
+                        0.72f to Color.Black.copy(alpha = DIM_EDGE_ALPHA),
+                        1.00f to Color.Black.copy(alpha = DIM_CORNER_ALPHA),
+                        center = center,
+                        radius = minDim * 0.72f,
+                    )
+                    clipRect {
+                        scale(scaleX = scaleX, scaleY = scaleY, pivot = center) {
+                            drawRect(brush)
+                        }
+                    }
+                }
             }
             content(viewport)
         }
     }
 }
+
+/** Subtle screenshot dimming beneath selection/lasso/cards, slightly brighter at center than edges. */
+private const val DIM_CENTER_ALPHA = 0.06f
+private const val DIM_MID_ALPHA = 0.075f
+private const val DIM_EDGE_ALPHA = 0.115f
+private const val DIM_CORNER_ALPHA = 0.15f
 
 private data class LockedCrop(
     val bitmap: Bitmap,
