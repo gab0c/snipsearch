@@ -54,7 +54,7 @@ internal class PaddleOcrEngine private constructor(
             fill = { planar ->
                 fillDetectorInput(argb, width, height, stride, detWidth, detHeight, scaleX, scaleY, planar)
             },
-        ) { shape, output, _ ->
+        ) { shape, output, _, _ ->
             require(shape.contentEquals(longArrayOf(1, 1, detHeight.toLong(), detWidth.toLong())))
             TextDetector.regions(output.floatBuffer!!, detWidth, detHeight)
         }
@@ -214,7 +214,7 @@ internal class PaddleOcrEngine private constructor(
         scaleY: Double,
     ): OcrTextBlockParcelable? {
         val height = 48
-        val contentWidth = ceil(height * region.aspectRatio(scaleX, scaleY)).toInt().coerceIn(16, 960)
+        val contentWidth = ceil(height * region.aspectRatio(scaleX, scaleY)).toInt().coerceIn(16, REC_MAX_WIDTH)
         val width = (((contentWidth + 31) / 32) * 32).coerceAtLeast(32)
         return infer(
             session = session,
@@ -239,7 +239,7 @@ internal class PaddleOcrEngine private constructor(
                     }
                 }
             },
-        ) { shape, output, tokenOutput ->
+        ) { shape, output, tokenOutput, planar ->
             val steps = shape[1].toInt()
             require(shape.contentEquals(longArrayOf(1, steps.toLong())) && output.type == OnnxJavaType.FLOAT)
             val ids = tokenOutput ?: error("Recognizer token output is missing")
@@ -252,19 +252,27 @@ internal class PaddleOcrEngine private constructor(
                 decodedWords, width.toDouble() / (contentWidth * steps) * region.aspectRatio(scaleX, scaleY),
             )
             if (words.isEmpty()) return@infer null
+            val refinedSpans = WordBoundsRefiner.refine(planar, width, contentWidth, height, steps, words)
             val starts = IntArray(words.size)
             val ends = IntArray(words.size)
             val bounds = IntArray(words.size * 4)
-            val positionScale = width.toDouble() / (contentWidth * steps)
             val text = buildString {
                 words.forEachIndexed { index, word ->
                     if (index > 0) append(' ')
                     starts[index] = length
                     append(word.text)
                     ends[index] = length
-                    val start = (word.firstStep * positionScale).coerceIn(0.0, 1.0)
-                    val end = (word.endStep * positionScale).coerceIn(start, 1.0)
-                    val box = region.bounds(start, end, scaleX, scaleY, image.width, image.height)
+                    val span = refinedSpans[index]
+                    val box = region.bounds(
+                        start = span.hStart,
+                        end = span.hEnd,
+                        scaleX = scaleX,
+                        scaleY = scaleY,
+                        width = image.width,
+                        height = image.height,
+                        vStart = span.vStart,
+                        vEnd = span.vEnd,
+                    )
                     bounds[index * 4] = box.left
                     bounds[index * 4 + 1] = box.top
                     bounds[index * 4 + 2] = box.right
@@ -374,7 +382,7 @@ internal class PaddleOcrEngine private constructor(
         width: Int,
         height: Int,
         fill: (FloatArray) -> Unit,
-        read: (LongArray, InferenceOutput, InferenceOutput?) -> T,
+        read: (LongArray, InferenceOutput, InferenceOutput?, FloatArray) -> T,
     ): T {
         val floatCount = 3 * width * height
         val planar = scratch.planarArray(floatCount)
@@ -390,7 +398,7 @@ internal class PaddleOcrEngine private constructor(
                     val auxiliary = if (result.size() > 1) result[1] as OnnxTensor else null
                     inferenceOutput(output).use { outputData ->
                         auxiliary?.let(::inferenceOutput).use { auxiliaryData ->
-                            return read(output.info.shape, outputData, auxiliaryData)
+                            return read(output.info.shape, outputData, auxiliaryData, planar)
                         }
                     }
                 }
@@ -429,6 +437,7 @@ internal class PaddleOcrEngine private constructor(
     companion object {
         private const val TAG = "SnipOcrEngine"
         private const val DET_MAX_SIDE = 736.0
+        private const val REC_MAX_WIDTH = 1280
         private val DET_MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val DET_STD = floatArrayOf(0.229f, 0.224f, 0.225f)
         private val DET_SCALE = FloatArray(3) { c -> 1f / (255f * DET_STD[c]) }

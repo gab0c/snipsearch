@@ -15,6 +15,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
@@ -135,14 +136,16 @@ internal fun SelectableTextLayer(
                 nearestWord(rects, p, 8.dp.toPx())
             }
             down.consume()
-            trail.start(p, down.uptimeMillis)
+            if (!movingHandle) trail.start(p, down.uptimeMillis)
             try {
                 if (!movingHandle) update(if (fixed >= 0) fixed..fixed else null)
                 do {
                     val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                     if (change.isConsumed) break
                     if (change.position != change.previousPosition) {
-                        if (change.pressed) trail.extend(change.position, change.uptimeMillis, density)
+                        if (!movingHandle && change.pressed) {
+                            trail.extend(change.position, change.uptimeMillis, density)
+                        }
                         if (fixed < 0) {
                             fixed = firstCrossedWord(rects, change.previousPosition, change.position)
                         }
@@ -159,9 +162,9 @@ internal fun SelectableTextLayer(
         }
     }) {
         if (selection != null && selection.first in rects.indices && selection.last in rects.indices) {
-            for (index in selection) {
-                val rect = rects[index]
-                drawRect(highlight.copy(alpha = 0.48f), rect.topLeft, rect.size)
+            val corner = CornerRadius(3.dp.toPx())
+            for (rect in selectionHighlightRects(words, rects, selection)) {
+                drawRoundRect(highlight.copy(alpha = 0.48f), rect.topLeft, rect.size, corner)
             }
             for (handle in listOf(anchor(selection.first, true), anchor(selection.last, false))) {
                 drawCircle(Color.White, 7.dp.toPx(), handle)
@@ -170,6 +173,42 @@ internal fun SelectableTextLayer(
         }
         trail.draw(this)
     }
+}
+
+internal fun selectionHighlightRects(
+    words: List<SelectableWord>,
+    rects: List<Rect>,
+    selection: IntRange,
+): List<Rect> {
+    val result = mutableListOf<Rect>()
+    var runBlock = -1
+    var runRect: Rect? = null
+    for (index in selection) {
+        if (index !in words.indices || index !in rects.indices) continue
+        val word = words[index]
+        val currRect = rects[index]
+        val currentRun = runRect
+        val canMerge = currentRun != null &&
+            word.block == runBlock &&
+            abs(currRect.top - currentRun.top) <= maxOf(4f, currentRun.height * 0.2f) &&
+            abs(currRect.bottom - currentRun.bottom) <= maxOf(4f, currentRun.height * 0.2f) &&
+            maxOf(currRect.left - currentRun.right, currentRun.left - currRect.right, 0f) <=
+            maxOf(currentRun.height * 2.0f, 32f)
+        if (canMerge) {
+            runRect = Rect(
+                minOf(currentRun.left, currRect.left),
+                minOf(currentRun.top, currRect.top),
+                maxOf(currentRun.right, currRect.right),
+                maxOf(currentRun.bottom, currRect.bottom),
+            )
+        } else {
+            if (currentRun != null) result += currentRun
+            runBlock = word.block
+            runRect = currRect
+        }
+    }
+    if (runRect != null) result += runRect
+    return result
 }
 
 internal fun nearestWord(rects: List<Rect>, point: Offset, tolerance: Float = Float.POSITIVE_INFINITY): Int {

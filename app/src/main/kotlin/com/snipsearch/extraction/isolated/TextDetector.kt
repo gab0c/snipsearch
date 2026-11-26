@@ -2,6 +2,7 @@ package com.snipsearch.extraction.isolated
 
 import com.snipsearch.extraction.PixelRegion
 import java.nio.FloatBuffer
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.cos
@@ -17,6 +18,8 @@ internal object TextDetector {
     private const val PIXEL_THRESH = 0.30f
     private const val REGION_SCORE_THRESH = 0.65
     private const val UNCLIP_RATIO = 1.4
+    private const val HORIZONTAL_SNAP_SIN = 0.045
+    private const val COMPACT_ANGLE_RATIO = 1.8
 
     fun regions(map: FloatBuffer, width: Int, height: Int): List<TextRegion> {
         val totalPixels = width * height
@@ -40,6 +43,10 @@ internal object TextDetector {
                 var sumXX = 0.0
                 var sumYY = 0.0
                 var sumXY = 0.0
+                var minX = width
+                var maxX = -1
+                var minY = height
+                var maxY = -1
                 while (head < tail) {
                     val index = queue[head++]
                     val x = index % width
@@ -50,6 +57,10 @@ internal object TextDetector {
                     sumXX += x.toDouble() * x
                     sumYY += y.toDouble() * y
                     sumXY += x.toDouble() * y
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
                     for (ny in maxOf(0, y - 1)..minOf(height - 1, y + 1)) {
                         for (nx in maxOf(0, x - 1)..minOf(width - 1, x + 1)) {
                             val neighbor = ny * width + nx
@@ -61,23 +72,45 @@ internal object TextDetector {
                     }
                 }
                 if (tail < 6 || total / tail < REGION_SCORE_THRESH) continue
-                val angle = 0.5 * atan2(2 * (sumXY - sumX * sumY / tail),
-                    sumXX - sumX * sumX / tail - sumYY + sumY * sumY / tail)
-                val dx = cos(angle)
-                val dy = sin(angle)
+                val rawAngle = 0.5 * atan2(
+                    2 * (sumXY - sumX * sumY / tail),
+                    sumXX - sumX * sumX / tail - sumYY + sumY * sumY / tail,
+                )
+                val rawDy = sin(rawAngle)
+                var dx = cos(rawAngle)
+                var dy = rawDy
                 var left = Double.POSITIVE_INFINITY
                 var top = Double.POSITIVE_INFINITY
                 var right = Double.NEGATIVE_INFINITY
                 var bottom = Double.NEGATIVE_INFINITY
-                for (i in 0 until tail) {
-                    val x = queue[i] % width + 0.5
-                    val y = queue[i] / width + 0.5
-                    val u = x * dx + y * dy
-                    val v = y * dx - x * dy
-                    left = minOf(left, u)
-                    right = maxOf(right, u)
-                    top = minOf(top, v)
-                    bottom = maxOf(bottom, v)
+                if (abs(rawDy) < HORIZONTAL_SNAP_SIN) {
+                    dx = 1.0
+                    dy = 0.0
+                    left = minX + 0.5
+                    right = maxX + 0.5
+                    top = minY + 0.5
+                    bottom = maxY + 0.5
+                } else {
+                    for (i in 0 until tail) {
+                        val x = queue[i] % width + 0.5
+                        val y = queue[i] / width + 0.5
+                        val u = x * dx + y * dy
+                        val v = y * dx - x * dy
+                        left = minOf(left, u)
+                        right = maxOf(right, u)
+                        top = minOf(top, v)
+                        bottom = maxOf(bottom, v)
+                    }
+                    val orientedW = right - left + 1
+                    val orientedH = bottom - top + 1
+                    if (maxOf(orientedW, orientedH) <= COMPACT_ANGLE_RATIO * minOf(orientedW, orientedH)) {
+                        dx = 1.0
+                        dy = 0.0
+                        left = minX + 0.5
+                        right = maxX + 0.5
+                        top = minY + 0.5
+                        bottom = maxY + 0.5
+                    }
                 }
                 val w = right - left + 1
                 val h = bottom - top + 1
@@ -110,9 +143,18 @@ internal data class TextRegion(
         (right - left) * hypot(dx * scaleX, dy * scaleY) /
             ((bottom - top) * hypot(dy * scaleX, dx * scaleY))
 
-    fun bounds(start: Double, end: Double, scaleX: Double, scaleY: Double, width: Int, height: Int): PixelRegion {
-        val xs = doubleArrayOf(x(start, 0.0), x(start, 1.0), x(end, 0.0), x(end, 1.0))
-        val ys = doubleArrayOf(y(start, 0.0), y(start, 1.0), y(end, 0.0), y(end, 1.0))
+    fun bounds(
+        start: Double,
+        end: Double,
+        scaleX: Double,
+        scaleY: Double,
+        width: Int,
+        height: Int,
+        vStart: Double = 0.0,
+        vEnd: Double = 1.0,
+    ): PixelRegion {
+        val xs = doubleArrayOf(x(start, vStart), x(start, vEnd), x(end, vStart), x(end, vEnd))
+        val ys = doubleArrayOf(y(start, vStart), y(start, vEnd), y(end, vStart), y(end, vEnd))
         return PixelRegion(
             floor(xs.min() * scaleX).toInt().coerceIn(0, width),
             floor(ys.min() * scaleY).toInt().coerceIn(0, height),

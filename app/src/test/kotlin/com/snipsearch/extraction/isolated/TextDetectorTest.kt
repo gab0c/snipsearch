@@ -84,4 +84,44 @@ class TextDetectorTest {
         assertEquals(1, TextDetector.regions(map, 16, 16).size)
     }
 
+    @Test
+    fun snapsTinyTiltAndCompactComponentsToHorizontalWhileKeepingAngledStrips() {
+        val width = 128
+        val height = 128
+        val map = FloatBuffer.allocate(width * height)
+        // Nearly horizontal line (~1.5 deg tilt due to a slight vertical step across 80px)
+        for (x in 10 until 90) {
+            val baseY = if (x < 50) 12 else 13
+            for (dy in 0 until 5) map.put((baseY + dy) * width + x, .9f)
+        }
+        // Compact near-square component with asymmetric corner activation
+        for (y in 40 until 47) for (x in 20 until 28) map.put(y * width + x, .98f)
+        map.put(47 * width + 27, .98f)
+        // Genuinely angled strip (~26 deg)
+        for (x in 20 until 65) for (dy in 0 until 5) map.put((x / 2 + 70 + dy) * width + x, .9f)
+
+        val regions = TextDetector.regions(map, width, height)
+        assertEquals(3, regions.size)
+        assertEquals(1.0, regions[0].dx, 1e-6)
+        assertEquals(0.0, regions[0].dy, 1e-6)
+        assertEquals(1.0, regions[1].dx, 1e-6)
+        assertEquals(0.0, regions[1].dy, 1e-6)
+        assertTrue(kotlin.math.abs(regions[2].dy) > .2)
+    }
+
+    @Test
+    fun boundsSupportsVerticalSubRangeForHorizontalAndAngledRegions() {
+        val horizontal = TextRegion(10.0, 20.0, 50.0, 40.0, 1.0, 0.0)
+        val narrowed = horizontal.bounds(0.25, 0.75, 2.0, 2.0, 200, 200, vStart = 0.25, vEnd = 0.75)
+        assertEquals(40, narrowed.left)
+        assertEquals(50, narrowed.top)
+        assertEquals(80, narrowed.right)
+        assertEquals(70, narrowed.bottom)
+
+        val angled = TextRegion(10.0, 20.0, 50.0, 40.0, 0.8, 0.6)
+        val full = angled.bounds(0.0, 1.0, 1.0, 1.0, 200, 200)
+        val tight = angled.bounds(0.0, 1.0, 1.0, 1.0, 200, 200, vStart = 0.25, vEnd = 0.75)
+        assertTrue(tight.height < full.height)
+    }
+
 }
