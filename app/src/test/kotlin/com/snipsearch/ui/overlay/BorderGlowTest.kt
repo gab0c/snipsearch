@@ -132,7 +132,7 @@ class BorderGlowTest {
 
     @Test
     fun traceDistancesAreMonotonicAcrossSeamAndLongerMidEdge() {
-        val tailSpan = COMET_TAIL_MILLIS.toFloat() / COMET_LAP_MILLIS
+        val tailSpan = traceTailLapSpan()
         val wrapped = traceSegmentDistances(perimeter, 0.05f, tailSpan, COMET_TAIL_SAMPLES)
         assertEquals(COMET_TAIL_SAMPLES, wrapped.size)
         assertEquals(perimeter.distanceAtLap(0.05f), wrapped.first(), 1e-4f)
@@ -154,25 +154,75 @@ class BorderGlowTest {
 
     @Test
     fun traceProfileFeathersLeadAndDecaysSmoothly() {
-        assertEquals(0f, traceProfile(0f).alphaScale, 1e-6f)
-        assertEquals(0f, traceProfile(1f).alphaScale, 1e-6f)
+        val tailSpan = traceTailLapSpan()
+        val leadLap = TRACE_LEAD_FRACTION * tailSpan
+        assertEquals(0f, traceProfile(0f, tailSpan).alphaScale, 1e-6f)
+        assertEquals(0f, traceProfile(tailSpan, tailSpan).alphaScale, 1e-6f)
 
         var prevAlpha = -1f
         for (i in 0..20) {
-            val p = TRACE_LEAD_FRACTION * i / 20f
-            val sample = traceProfile(p)
-            assertTrue("lead alpha must rise at $p", sample.alphaScale >= prevAlpha)
-            assertTrue("width out of range at $p: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
+            val back = leadLap * i / 20f
+            val sample = traceProfile(back, tailSpan)
+            assertTrue("lead alpha must rise at $back", sample.alphaScale >= prevAlpha)
+            assertTrue("width out of range at $back: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
             prevAlpha = sample.alphaScale
         }
 
         prevAlpha = Float.MAX_VALUE
         for (i in 0..80) {
-            val p = TRACE_LEAD_FRACTION + (1f - TRACE_LEAD_FRACTION) * i / 80f
-            val sample = traceProfile(p)
-            assertTrue("tail alpha must decay at $p", sample.alphaScale <= prevAlpha)
-            assertTrue("width out of range at $p: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
+            val back = leadLap + (tailSpan - leadLap) * i / 80f
+            val sample = traceProfile(back, tailSpan)
+            assertTrue("tail alpha must decay at $back", sample.alphaScale <= prevAlpha)
+            assertTrue("width out of range at $back: ${sample.widthScale}", sample.widthScale in 0.45f..1f)
             prevAlpha = sample.alphaScale
+        }
+    }
+
+    @Test
+    fun mergeClosesGapExactlyAtOpposingTail() {
+        val tailSpan = traceTailLapSpan()
+        val gapLap = traceMergeGapLap()
+        assertTrue("gapLap must be positive, was $gapLap", gapLap > 0f)
+        assertEquals(1f / COMET_COUNT, tailSpan + gapLap, 1e-6f)
+
+        for (lap in listOf(0.0f, 0.13f, 0.48f, 0.91f)) {
+            val trace0HeadAtMerge = perimeter.cometPoint(wrap01(lap + gapLap))
+            val trace1AnchoredTail = perimeter.cometPoint(wrap01(lap + 1f / COMET_COUNT - tailSpan))
+            assertPoint(trace1AnchoredTail, trace0HeadAtMerge)
+
+            val trace1HeadAtMerge = perimeter.cometPoint(wrap01(lap + 1f / COMET_COUNT + gapLap))
+            val trace0AnchoredTail = perimeter.cometPoint(wrap01(lap - tailSpan))
+            assertPoint(trace0AnchoredTail, trace1HeadAtMerge)
+        }
+    }
+
+    @Test
+    fun mergeRemovesTailDecayAndGrowsTailToFullBorder() {
+        val tailSpan = traceTailLapSpan()
+        val gapLap = traceMergeGapLap()
+        val leadLap = TRACE_LEAD_FRACTION * tailSpan
+
+        val extraMid = gapLap * 0.5f
+        val sweptSample = traceProfile(leadLap + extraMid * 0.5f, tailSpan, extraMid, mergeProgress = 0.5f)
+        assertEquals(1f, sweptSample.widthScale, 1e-6f)
+        assertEquals(1.06f, sweptSample.alphaScale, 1e-4f)
+
+        val beforeLead = traceProfile(leadLap - 1e-5f, tailSpan, extraMid, mergeProgress = 0.5f)
+        val afterLead = traceProfile(leadLap + 1e-5f, tailSpan, extraMid, mergeProgress = 0.5f)
+        assertEquals(beforeLead.alphaScale, afterLead.alphaScale, 1e-3f)
+        assertEquals(beforeLead.widthScale, afterLead.widthScale, 1e-3f)
+
+        val tailEndLoading = traceProfile(tailSpan, tailSpan, 0f, mergeProgress = 0f)
+        val tailEndMerging = traceProfile(tailSpan + extraMid, tailSpan, extraMid, mergeProgress = 0.5f)
+        assertTrue("tail end alpha should grow: ${tailEndMerging.alphaScale} vs ${tailEndLoading.alphaScale}", tailEndMerging.alphaScale > 0.45f)
+        assertEquals(0.75f, tailEndMerging.widthScale, 1e-4f)
+
+        val fullSpan = tailSpan + gapLap
+        for (i in 0..50) {
+            val back = fullSpan * i / 50f
+            val settled = traceProfile(back, tailSpan, gapLap, mergeProgress = 1f)
+            assertEquals("alpha at $back", 1f, settled.alphaScale, 1e-5f)
+            assertEquals("width at $back", 1f, settled.widthScale, 1e-5f)
         }
     }
 

@@ -5,12 +5,12 @@ import android.view.RoundedCorner
 import android.view.View
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,7 +44,6 @@ import kotlinx.coroutines.launch
 
 internal const val GLOW_FADE_IN_MILLIS = 300
 internal const val TRACE_FADE_IN_MILLIS = 220
-internal const val GLOW_SETTLE_MILLIS = 500
 internal const val COMET_LAP_MILLIS = 4600L
 internal const val COMET_TAIL_MILLIS = 1750L
 internal const val COMET_COUNT = 2
@@ -59,11 +58,23 @@ private const val LAP_NANOS = COMET_LAP_MILLIS * 1_000_000L
 
 private val glowColor = SnipColors.SnipBlueGlow
 
+private enum class GlowPhase {
+    IDLE_FADE_IN,
+    LOADING,
+    MERGING,
+    SETTLED,
+}
+
+internal fun traceTailLapSpan(): Float = COMET_TAIL_MILLIS.toFloat() / COMET_LAP_MILLIS
+
+internal fun traceMergeGapLap(): Float = (1f / COMET_COUNT) - traceTailLapSpan()
+
 /**
  * Soft glow that hugs all four screen edges and follows the display's rounded corners. While
- * [loading] is true, two luminous traces sweep around the perimeter to create the border glow,
- * then cross-fade smoothly into the steady border glow once loading completes. The composable is
- * non-interactive and stops its frame loop once the traces dissolve.
+ * [loading] is true, two luminous traces sweep around the perimeter; when loading completes,
+ * their leading fronts continue to close the gap to each other's anchored tails while the thinner
+ * tail ends grow seamlessly into the steady border glow. The composable is non-interactive and
+ * stops its frame loop once settled.
  */
 @Composable
 internal fun BorderGlow(loading: Boolean, modifier: Modifier = Modifier) {
@@ -73,36 +84,65 @@ internal fun BorderGlow(loading: Boolean, modifier: Modifier = Modifier) {
         Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
     }
     val traceWanted = loading && !reducedMotion
+    val tailSpan = traceTailLapSpan()
+    val gapLap = traceMergeGapLap()
 
+    var phase by remember { mutableStateOf(if (traceWanted) GlowPhase.LOADING else GlowPhase.IDLE_FADE_IN) }
     val traceAlpha = remember { Animatable(0f) }
     val steadyGlowAlpha = remember { Animatable(0f) }
-    var hasShownTrace by remember { mutableStateOf(false) }
+    var elapsedNanos by remember { mutableLongStateOf(0L) }
+    var mergeStartNanos by remember { mutableLongStateOf(0L) }
+    var mergeStartLap by remember { mutableFloatStateOf(0f) }
 
     LaunchedEffect(traceWanted) {
         if (traceWanted) {
-            hasShownTrace = true
-            coroutineScope {
-                launch { steadyGlowAlpha.animateTo(0f, tween(TRACE_FADE_IN_MILLIS, easing = FastOutSlowInEasing)) }
-                launch { traceAlpha.animateTo(1f, tween(TRACE_FADE_IN_MILLIS, easing = FastOutSlowInEasing)) }
+            val wasSettled = phase == GlowPhase.SETTLED || steadyGlowAlpha.value > 0f
+            phase = GlowPhase.LOADING
+            if (wasSettled) {
+                traceAlpha.snapTo(0f)
+                coroutineScope {
+                    launch { steadyGlowAlpha.animateTo(0f, tween(TRACE_FADE_IN_MILLIS, easing = FastOutSlowInEasing)) }
+                    launch { traceAlpha.animateTo(1f, tween(TRACE_FADE_IN_MILLIS, easing = FastOutSlowInEasing)) }
+                }
+            } else {
+                traceAlpha.animateTo(1f, tween(TRACE_FADE_IN_MILLIS, easing = FastOutSlowInEasing))
             }
         } else {
-            val duration = if (hasShownTrace) GLOW_SETTLE_MILLIS else GLOW_FADE_IN_MILLIS
-            coroutineScope {
-                launch { steadyGlowAlpha.animateTo(1f, tween(duration, easing = FastOutSlowInEasing)) }
-                launch { traceAlpha.animateTo(0f, tween(duration, easing = LinearEasing)) }
+            when (phase) {
+                GlowPhase.LOADING -> {
+                    mergeStartNanos = elapsedNanos
+                    mergeStartLap = (elapsedNanos % LAP_NANOS).toFloat() / LAP_NANOS
+                    phase = GlowPhase.MERGING
+                    if (traceAlpha.value < 1f) {
+                        traceAlpha.animateTo(1f, tween(120, easing = FastOutSlowInEasing))
+                    }
+                }
+                GlowPhase.IDLE_FADE_IN -> {
+                    steadyGlowAlpha.animateTo(1f, tween(GLOW_FADE_IN_MILLIS, easing = FastOutSlowInEasing))
+                    phase = GlowPhase.SETTLED
+                }
+                GlowPhase.MERGING, GlowPhase.SETTLED -> Unit
             }
         }
     }
 
-    var elapsedNanos by remember { mutableLongStateOf(0L) }
-    val animating = traceWanted || traceAlpha.value > 0f
-    LaunchedEffect(animating) {
-        if (!animating) return@LaunchedEffect
+    val running = phase == GlowPhase.LOADING || phase == GlowPhase.MERGING
+    LaunchedEffect(running) {
+        if (!running) return@LaunchedEffect
+        elapsedNanos = 0L
         var start = -1L
         while (true) {
             withFrameNanos { now ->
                 if (start < 0L) start = now
                 elapsedNanos = now - start
+            }
+            if (phase == GlowPhase.MERGING) {
+                val deltaLap = ((elapsedNanos - mergeStartNanos).coerceAtLeast(0L)).toFloat() / LAP_NANOS
+                if (deltaLap >= gapLap && traceAlpha.value >= 0.999f) {
+                    steadyGlowAlpha.snapTo(1f)
+                    phase = GlowPhase.SETTLED
+                    break
+                }
             }
         }
     }
@@ -155,17 +195,38 @@ internal fun BorderGlow(loading: Boolean, modifier: Modifier = Modifier) {
         val perimeter = outline ?: return@Canvas
         val closedPath = borderPath ?: return@Canvas
 
-        val steadyOpacity = steadyGlowAlpha.value
-        if (steadyOpacity > 0f) {
-            drawGlowStack(closedPath, layers, steadyOpacity)
-        }
-
-        val traceOpacity = traceAlpha.value
-        if (traceOpacity > 0f) {
-            val lap = (elapsedNanos % LAP_NANOS).toFloat() / LAP_NANOS
-            repeat(COMET_COUNT) { index ->
-                val headLap = wrap01(lap + index.toFloat() / COMET_COUNT)
-                drawGlowTrace(perimeter, layers, headLap, traceOpacity, tracePath)
+        when (phase) {
+            GlowPhase.IDLE_FADE_IN -> drawGlowStack(closedPath, layers, steadyGlowAlpha.value)
+            GlowPhase.SETTLED -> drawGlowStack(closedPath, layers, 1f)
+            GlowPhase.LOADING -> {
+                val steadyOpacity = steadyGlowAlpha.value
+                if (steadyOpacity > 0f) {
+                    drawGlowStack(closedPath, layers, steadyOpacity)
+                }
+                val traceOpacity = traceAlpha.value
+                if (traceOpacity > 0f) {
+                    val lap = (elapsedNanos % LAP_NANOS).toFloat() / LAP_NANOS
+                    repeat(COMET_COUNT) { index ->
+                        val headLap = wrap01(lap + index.toFloat() / COMET_COUNT)
+                        drawGlowTrace(perimeter, layers, headLap, tailSpan, 0f, 0f, traceOpacity, tracePath)
+                    }
+                }
+            }
+            GlowPhase.MERGING -> {
+                val traceOpacity = traceAlpha.value
+                if (traceOpacity > 0f) {
+                    val deltaLap = ((elapsedNanos - mergeStartNanos).coerceAtLeast(0L)).toFloat() / LAP_NANOS
+                    val extraLap = deltaLap.coerceAtMost(gapLap)
+                    val mergeProgress = if (gapLap > 0f) (extraLap / gapLap).coerceIn(0f, 1f) else 1f
+                    if (mergeProgress >= 1f) {
+                        drawGlowStack(closedPath, layers, traceOpacity)
+                    } else {
+                        repeat(COMET_COUNT) { index ->
+                            val headLap = wrap01(mergeStartLap + index.toFloat() / COMET_COUNT + extraLap)
+                            drawGlowTrace(perimeter, layers, headLap, tailSpan, extraLap, mergeProgress, traceOpacity, tracePath)
+                        }
+                    }
+                }
             }
         }
     }
@@ -186,17 +247,22 @@ private fun DrawScope.drawGlowTrace(
     outline: RoundedPerimeter,
     layers: List<GlowLayer>,
     headLap: Float,
+    tailSpan: Float,
+    extraLap: Float,
+    mergeProgress: Float,
     opacity: Float,
     scratchPath: Path,
 ) {
-    val tailSpan = COMET_TAIL_MILLIS.toFloat() / COMET_LAP_MILLIS
-    val distances = traceSegmentDistances(outline, headLap, tailSpan, COMET_TAIL_SAMPLES, COMET_SLOWDOWN)
-    val segments = COMET_TAIL_SAMPLES - 1
+    val arcSpan = tailSpan + extraLap
+    val samples = ((COMET_TAIL_SAMPLES * (arcSpan / tailSpan)).toInt()).coerceIn(COMET_TAIL_SAMPLES, 72)
+    val distances = traceSegmentDistances(outline, headLap, arcSpan, samples, COMET_SLOWDOWN)
+    val segments = samples - 1
     for (i in 0 until segments) {
         val dStart = distances[i + 1]
         val dEnd = distances[i]
         if (dEnd - dStart <= 1e-3f) continue
-        val profile = traceProfile((i + 0.5f) / segments)
+        val backLap = arcSpan * (i + 0.5f) / segments
+        val profile = traceProfile(backLap, tailSpan, extraLap, mergeProgress)
         val segAlpha = profile.alphaScale * opacity
         if (segAlpha <= 0.002f) continue
         scratchPath.rewind()
@@ -243,27 +309,46 @@ internal data class GlowLayer(val halfWidthDp: Float, val alpha: Float)
 /** Opacity and stroke-width multipliers along a glowing perimeter trace (`0` = tip, `1` = tail). */
 internal data class TraceSampleProfile(val alphaScale: Float, val widthScale: Float)
 
+private fun smoothstep(x: Float): Float {
+    val u = x.coerceIn(0f, 1f)
+    return u * u * (3f - 2f * u)
+}
+
 /**
- * Computes a feathered leading edge over `[0, TRACE_LEAD_FRACTION]` followed by a long smooth
- * glow decay over `[TRACE_LEAD_FRACTION, 1]`, keeping the border-glow thickness rather than
- * pinching to a thin line or forming a discrete circle.
+ * Computes opacity and stroke-width scales [backLap] behind the leading tip for a trace with
+ * nominal loading span [tailSpan]. During loading (`extraLap = 0f, mergeProgress = 0f`) the
+ * leading [TRACE_LEAD_FRACTION] feathers up smoothly and the remainder decays along the tail.
+ * During completion merge (`mergeProgress` advancing `0 -> 1` in step with `extraLap` closing
+ * the gap to the opposing trace), newly swept border behind the leading nose retains full glow
+ * without tail decay while the thinner tail grows to match the settled border (`1f, 1f`).
  */
-internal fun traceProfile(progress: Float): TraceSampleProfile {
-    val p = progress.coerceIn(0f, 1f)
-    return if (p < TRACE_LEAD_FRACTION) {
-        val u = p / TRACE_LEAD_FRACTION
-        val lead = u * u * (3f - 2f * u)
-        TraceSampleProfile(
-            alphaScale = 1.12f * lead,
-            widthScale = 0.45f + 0.55f * lead,
-        )
-    } else {
-        val t = (p - TRACE_LEAD_FRACTION) / (1f - TRACE_LEAD_FRACTION)
-        TraceSampleProfile(
-            alphaScale = 1.12f * (1f - t).pow(1.45f),
-            widthScale = 0.50f + 0.50f * (1f - t).pow(0.7f),
+internal fun traceProfile(
+    backLap: Float,
+    tailSpan: Float,
+    extraLap: Float = 0f,
+    mergeProgress: Float = 0f,
+): TraceSampleProfile {
+    val leadLap = TRACE_LEAD_FRACTION * tailSpan
+    val p = mergeProgress.coerceIn(0f, 1f)
+    val peakAlpha = 1.12f + (1f - 1.12f) * p
+    if (backLap < leadLap) {
+        val lead = smoothstep(backLap / leadLap)
+        val noseMerge = smoothstep((p - 0.70f) / 0.30f)
+        val loadingWidth = 0.45f + 0.55f * lead
+        return TraceSampleProfile(
+            alphaScale = peakAlpha * (lead + (1f - lead) * noseMerge),
+            widthScale = loadingWidth + (1f - loadingWidth) * noseMerge,
         )
     }
+    val tailDecaySpan = (tailSpan - leadLap).coerceAtLeast(1e-5f)
+    val decayBack = (backLap - leadLap - extraLap).coerceAtLeast(0f)
+    val t = (decayBack / tailDecaySpan).coerceIn(0f, 1f)
+    val baseAlpha = (1f - t).pow(1.45f)
+    val loadingWidth = 0.50f + 0.50f * (1f - t).pow(0.7f)
+    return TraceSampleProfile(
+        alphaScale = peakAlpha * (baseAlpha + (1f - baseAlpha) * p),
+        widthScale = loadingWidth + (1f - loadingWidth) * p,
+    )
 }
 
 /**
