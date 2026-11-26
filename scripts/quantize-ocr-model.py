@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from array import array
+import math
 from pathlib import Path
 import struct
 import sys
@@ -12,10 +13,14 @@ import sys
 WEIGHT_AXIS = {"Conv": 0, "ConvTranspose": 1, "MatMul": -1, "Gemm": -1}
 
 TENSOR_FLOAT = 1
+TENSOR_UINT8 = 2
 TENSOR_INT8 = 3
+TENSOR_INT32 = 6
 TENSOR_INT64 = 7
 
+ATTR_FLOAT = 1
 ATTR_INT = 2
+ATTR_INTS = 7
 
 
 def read_varint(buf: bytes | memoryview, pos: int) -> tuple[int, int]:
@@ -155,6 +160,74 @@ def encode_tensor(name: str, dims: list[int], data_type: int, raw_bytes: bytes) 
     return b"".join(parts)
 
 
+def encode_field_fixed32(field: int, payload: bytes) -> bytes:
+    assert len(payload) == 4
+    return encode_varint((field << 3) | 5) + payload
+
+
+def decode_tensor_raw(tensor_bytes: bytes) -> tuple[str, list[int], int, bytes]:
+    fields = parse_fields(tensor_bytes)
+    dims = decode_repeated_int64(fields, 1)
+    data_type = 0
+    name = ""
+    raw_data: bytes | None = None
+    float_parts: list[float] = []
+    int64_parts: list[int] = []
+    int32_parts: list[int] = []
+    for f, w, v, _ in fields:
+        if f == 2 and w == 0:
+            assert isinstance(v, int)
+            data_type = v
+        elif f == 8 and w == 2:
+            assert isinstance(v, bytes)
+            name = v.decode("utf-8")
+        elif f == 9 and w == 2:
+            assert isinstance(v, bytes)
+            raw_data = v
+        elif f == 4:
+            if w == 5:
+                assert isinstance(v, bytes)
+                float_parts.append(struct.unpack("<f", v)[0])
+            elif w == 2:
+                assert isinstance(v, bytes)
+                arr = array("f")
+                arr.frombytes(v)
+                if sys.byteorder != "little":
+                    arr.byteswap()
+                float_parts.extend(arr)
+        elif f == 5:
+            if w == 0:
+                assert isinstance(v, int)
+                int32_parts.append(decode_signed_varint(v))
+            elif w == 2:
+                assert isinstance(v, bytes)
+                p = 0
+                while p < len(v):
+                    item, p = read_varint(v, p)
+                    int32_parts.append(decode_signed_varint(item))
+        elif f == 7:
+            if w == 0:
+                assert isinstance(v, int)
+                int64_parts.append(decode_signed_varint(v))
+            elif w == 2:
+                assert isinstance(v, bytes)
+                p = 0
+                while p < len(v):
+                    item, p = read_varint(v, p)
+                    int64_parts.append(decode_signed_varint(item))
+        elif f == 13:
+            raise ValueError(f"External tensor data not supported for {name}")
+    if raw_data is not None:
+        return name, dims, data_type, raw_data
+    if data_type == TENSOR_FLOAT and float_parts:
+        return name, dims, data_type, pack_float32_le(float_parts)
+    if data_type == TENSOR_INT64 and int64_parts:
+        return name, dims, data_type, pack_int64_le(int64_parts)
+    if data_type == TENSOR_INT32 and int32_parts:
+        return name, dims, data_type, struct.pack(f"<{len(int32_parts)}i", *int32_parts)
+    return name, dims, data_type, b""
+
+
 def make_int_attr(name: str, value: int) -> bytes:
     return (
         encode_field_bytes(1, name.encode("utf-8"))
@@ -163,12 +236,33 @@ def make_int_attr(name: str, value: int) -> bytes:
     )
 
 
+def make_float_attr(name: str, value: float) -> bytes:
+    return (
+        encode_field_bytes(1, name.encode("utf-8"))
+        + encode_field_fixed32(2, struct.pack("<f", value))
+        + encode_field_varint(20, ATTR_FLOAT)
+    )
+
+
 def make_ints_attr(name: str, values: list[int]) -> bytes:
     return (
         encode_field_bytes(1, name.encode("utf-8"))
         + encode_field_bytes(8, b"".join(encode_varint(v) for v in values))
-        + encode_field_varint(20, 7)  # AttributeProto.INTS
+        + encode_field_varint(20, ATTR_INTS)
     )
+
+
+def attr_float_value(attr_bytes: bytes) -> tuple[str, float | None]:
+    name = ""
+    f_val: float | None = None
+    for f, w, v, _ in parse_fields(attr_bytes):
+        if f == 1 and w == 2:
+            assert isinstance(v, bytes)
+            name = v.decode("utf-8")
+        elif f == 2 and w == 5:
+            assert isinstance(v, bytes)
+            f_val = struct.unpack("<f", v)[0]
+    return name, f_val
 
 
 def make_node(op_type: str, inputs: list[str], outputs: list[str], attrs: list[bytes], name: str = "") -> bytes:
@@ -276,6 +370,349 @@ def pack_int64_le(values: list[int]) -> bytes:
     return struct.pack(f"<{len(values)}q", *values)
 
 
+def decode_float_list(raw_bytes: bytes) -> list[float]:
+    count = len(raw_bytes) // 4
+    return list(struct.unpack(f"<{count}f", raw_bytes))
+
+
+def decode_int64_list(raw_bytes: bytes) -> list[int]:
+    count = len(raw_bytes) // 8
+    return list(struct.unpack(f"<{count}q", raw_bytes))
+
+
+def optimize_graph_structure(
+    nodes: list[bytes],
+    initializers: list[bytes],
+    outputs: list[bytes],
+) -> tuple[list[bytes], list[bytes], list[bytes]]:
+    decoded = [list(decode_node(n)) for n in nodes]
+    init_map: dict[str, tuple[list[int], int, bytes]] = {}
+    for ib in initializers:
+        tname, dims, dt, raw = decode_tensor_raw(ib)
+        init_map[tname] = (dims, dt, raw)
+
+    graph_out_names = [
+        next(vv.decode("utf-8") for vf, vw, vv, _ in parse_fields(o) if vf == 1)
+        for o in outputs
+    ]
+
+    def rebuild_node(entry: list) -> bytes:
+        return make_node(entry[1], entry[2], entry[3], entry[4], name=entry[0])
+
+    # 1. Eliminate Identity nodes by aliasing outputs to resolved inputs.
+    alias: dict[str, str] = {}
+
+    def resolve(t: str) -> str:
+        while t in alias:
+            t = alias[t]
+        return t
+
+    no_id: list[list] = []
+    for nm, op, ins, outs, attrs in decoded:
+        ins = [resolve(x) for x in ins]
+        if op == "Identity" and len(ins) == 1 and len(outs) == 1:
+            if outs[0] in graph_out_names and ins[0] not in graph_out_names:
+                # Preserve graph output tensor name by renaming producer if unique, else keep Identity.
+                renamed = False
+                for p in reversed(no_id):
+                    if ins[0] in p[3]:
+                        p[3] = [outs[0] if x == ins[0] else x for x in p[3]]
+                        for qnode in no_id:
+                            qnode[2] = [outs[0] if x == ins[0] else x for x in qnode[2]]
+                        alias = {k: (outs[0] if v == ins[0] else v) for k, v in alias.items()}
+                        alias[ins[0]] = outs[0]
+                        renamed = True
+                        break
+                if renamed:
+                    continue
+            else:
+                alias[outs[0]] = ins[0]
+                continue
+        no_id.append([nm, op, ins, outs, attrs])
+    decoded = no_id
+
+    def count_uses(node_list: list[list]) -> tuple[dict[str, int], dict[str, list[int]]]:
+        uses: dict[str, int] = {o: 1 for o in graph_out_names}
+        consumers: dict[str, list[int]] = {}
+        for idx, entry in enumerate(node_list):
+            for x in entry[2]:
+                if x:
+                    uses[x] = uses.get(x, 0) + 1
+                    consumers.setdefault(x, []).append(idx)
+        return uses, consumers
+
+    # 2. Cancel back-to-back inverse Transpose pairs.
+    changed = True
+    while changed:
+        changed = False
+        uses, consumers = count_uses(decoded)
+        skip: set[int] = set()
+        for idx, (nm, op, ins, outs, attrs) in enumerate(decoded):
+            if idx in skip or op != "Transpose" or len(ins) != 1 or len(outs) != 1:
+                continue
+            y = outs[0]
+            if uses.get(y, 0) != 1:
+                continue
+            cidxs = consumers.get(y, [])
+            if len(cidxs) != 1:
+                continue
+            cidx = cidxs[0]
+            cnm, cop, cins, couts, cattrs = decoded[cidx]
+            if cop != "Transpose":
+                continue
+            p1 = next((attr_name_and_info(a)[2] for a in attrs if attr_name_and_info(a)[0] == "perm"), [])
+            p2 = next((attr_name_and_info(a)[2] for a in cattrs if attr_name_and_info(a)[0] == "perm"), [])
+            if p1 and len(p1) == len(p2) and [p1[k] for k in p2] == list(range(len(p1))):
+                old_out = couts[0]
+                if old_out in graph_out_names:
+                    continue
+                src = ins[0]
+                skip.add(idx)
+                skip.add(cidx)
+                for node in decoded:
+                    node[2] = [src if x == old_out else x for x in node[2]]
+                changed = True
+                break
+        if skip:
+            decoded = [n for i, n in enumerate(decoded) if i not in skip]
+
+    # 3. Fold Conv / ConvTranspose + constant bias Add into the 3rd Conv/ConvTranspose input.
+    uses, consumers = count_uses(decoded)
+    skip = set()
+    for idx, entry in enumerate(decoded):
+        if idx in skip:
+            continue
+        nm, op, ins, outs, attrs = entry
+        if op not in ("Conv", "ConvTranspose") or len(ins) != 2 or len(outs) != 1:
+            continue
+        if uses.get(outs[0], 0) != 1:
+            continue
+        cidx = consumers.get(outs[0], [-1])[0]
+        if cidx < 0 or decoded[cidx][1] != "Add":
+            continue
+        c_ins = decoded[cidx][2]
+        other = [x for x in c_ins if x != outs[0]]
+        if len(other) != 1 or other[0] not in init_map:
+            continue
+        w_info = init_map.get(ins[1])
+        b_info = init_map.get(other[0])
+        if w_info is None or b_info is None or b_info[1] != TENSOR_FLOAT:
+            continue
+        w_dims = w_info[0]
+        group = 1
+        for a in attrs:
+            an, ai, _, _ = attr_name_and_info(a)
+            if an == "group" and ai is not None:
+                group = ai
+        out_channels = w_dims[0] if op == "Conv" else w_dims[1] * group
+        b_dims, _, b_raw = b_info
+        b_numel = math.prod(b_dims) if b_dims else 1
+        if b_numel != out_channels:
+            continue
+        if len(b_dims) == 4 and (b_dims[0] != 1 or b_dims[1] != out_channels or b_dims[2] != 1 or b_dims[3] != 1):
+            continue
+        if len(b_dims) not in (1, 4):
+            continue
+        flat_bias_name = f"{outs[0]}__folded_bias"
+        while flat_bias_name in init_map:
+            flat_bias_name += "_"
+        init_map[flat_bias_name] = ([out_channels], TENSOR_FLOAT, b_raw)
+        entry[2] = [ins[0], ins[1], flat_bias_name]
+        entry[3] = [decoded[cidx][3][0]]
+        skip.add(cidx)
+    if skip:
+        decoded = [n for i, n in enumerate(decoded) if i not in skip]
+
+    # 4. Cancel direct Squeeze(axes) -> Unsqueeze(axes) pairs and bypass 4D->3D->4D around HardSwish.
+    changed = True
+    while changed:
+        changed = False
+        uses, consumers = count_uses(decoded)
+        for idx, (nm, op, ins, outs, attrs) in enumerate(decoded):
+            if op != "Squeeze" or len(ins) != 2 or len(outs) != 1:
+                continue
+            axes_info = init_map.get(ins[1])
+            if axes_info is None or axes_info[1] != TENSOR_INT64:
+                continue
+            axes1 = decode_int64_list(axes_info[2])
+            s_out = outs[0]
+            cidxs = consumers.get(s_out, [])
+            # Case A: direct Squeeze -> Unsqueeze
+            if uses.get(s_out, 0) == 1 and len(cidxs) == 1 and decoded[cidxs[0]][1] == "Unsqueeze":
+                u_out = decoded[cidxs[0]][3][0]
+                if u_out in graph_out_names:
+                    continue
+                u_ins = decoded[cidxs[0]][2]
+                u_axes = init_map.get(u_ins[1]) if len(u_ins) == 2 else None
+                if u_axes and u_axes[1] == TENSOR_INT64 and decode_int64_list(u_axes[2]) == axes1:
+                    src = ins[0]
+                    decoded = [n for i, n in enumerate(decoded) if i not in (idx, cidxs[0])]
+                    for node in decoded:
+                        node[2] = [src if x == u_out else x for x in node[2]]
+                    changed = True
+                    break
+
+    # 5. Fold BatchNormalization into preceding Conv (direct or across a single Squeeze(axes=[2])).
+    uses, consumers = count_uses(decoded)
+    skip = set()
+    # Keep track of weight initializers to avoid mutating shared weights in place.
+    init_use_counts: dict[str, int] = {}
+    for entry in decoded:
+        for x in entry[2]:
+            if x in init_map:
+                init_use_counts[x] = init_use_counts.get(x, 0) + 1
+
+    for idx, entry in enumerate(decoded):
+        if idx in skip:
+            continue
+        nm, op, ins, outs, attrs = entry
+        if op != "Conv" or len(outs) != 1 or ins[1] not in init_map:
+            continue
+        w_dims, w_dt, w_raw = init_map[ins[1]]
+        if w_dt != TENSOR_FLOAT or len(w_dims) != 4 or init_use_counts.get(ins[1], 0) != 1:
+            continue
+        conv_out = outs[0]
+        if uses.get(conv_out, 0) != 1:
+            continue
+        c1_idx = consumers[conv_out][0]
+        sq_idx: int | None = None
+        if decoded[c1_idx][1] == "BatchNormalization":
+            bn_idx = c1_idx
+        elif decoded[c1_idx][1] == "Squeeze" and uses.get(decoded[c1_idx][3][0], 0) == 1:
+            sq_out = decoded[c1_idx][3][0]
+            c2_idx = consumers[sq_out][0]
+            if decoded[c2_idx][1] != "BatchNormalization":
+                continue
+            sq_idx = c1_idx
+            bn_idx = c2_idx
+        else:
+            continue
+
+        bn_ins = decoded[bn_idx][2]
+        bn_outs = decoded[bn_idx][3]
+        bn_attrs = decoded[bn_idx][4]
+        if len(bn_ins) < 5 or any(x not in init_map for x in bn_ins[1:5]):
+            continue
+        oc = w_dims[0]
+        gamma_d, gamma_dt, gamma_raw = init_map[bn_ins[1]]
+        beta_d, beta_dt, beta_raw = init_map[bn_ins[2]]
+        mean_d, mean_dt, mean_raw = init_map[bn_ins[3]]
+        var_d, var_dt, var_raw = init_map[bn_ins[4]]
+        if not all(dt == TENSOR_FLOAT and d == [oc] for d, dt in (
+            (gamma_d, gamma_dt), (beta_d, beta_dt), (mean_d, mean_dt), (var_d, var_dt)
+        )):
+            continue
+        eps = 1e-5
+        for a in bn_attrs:
+            an, fv = attr_float_value(a)
+            if an == "epsilon" and fv is not None:
+                eps = fv
+
+        gamma = decode_float_list(gamma_raw)
+        beta = decode_float_list(beta_raw)
+        mean = decode_float_list(mean_raw)
+        var = decode_float_list(var_raw)
+        w_vals = decode_float_list(w_raw)
+        if len(ins) == 3:
+            b_dims, b_dt, b_raw = init_map[ins[2]]
+            if b_dt != TENSOR_FLOAT or b_dims != [oc]:
+                continue
+            b_vals = decode_float_list(b_raw)
+        else:
+            b_vals = [0.0] * oc
+
+        inner = len(w_vals) // oc
+        new_w = [0.0] * len(w_vals)
+        new_b = [0.0] * oc
+        for c in range(oc):
+            scale = gamma[c] / math.sqrt(var[c] + eps)
+            base = c * inner
+            for j in range(inner):
+                new_w[base + j] = w_vals[base + j] * scale
+            new_b[c] = (b_vals[c] - mean[c]) * scale + beta[c]
+
+        init_map[ins[1]] = (w_dims, TENSOR_FLOAT, pack_float32_le(new_w))
+        bias_name = ins[2] if len(ins) == 3 else f"{conv_out}__bn_bias"
+        while len(ins) < 3 and bias_name in init_map:
+            bias_name += "_"
+        init_map[bias_name] = ([oc], TENSOR_FLOAT, pack_float32_le(new_b))
+        if len(ins) < 3:
+            entry[2] = [ins[0], ins[1], bias_name]
+        if sq_idx is None:
+            entry[3] = [bn_outs[0]]
+            skip.add(bn_idx)
+        else:
+            # Keep Squeeze after Conv so Conv stays 4D and BN disappears.
+            decoded[sq_idx][3] = [bn_outs[0]]
+            skip.add(bn_idx)
+    if skip:
+        decoded = [n for i, n in enumerate(decoded) if i not in skip]
+
+    # 6. Keep Conv+HardSwish (HardSigmoid + Mul) in 4D by deferring Squeeze(axes=[2]) until after Mul.
+    changed = True
+    while changed:
+        changed = False
+        uses, consumers = count_uses(decoded)
+        for idx, entry in enumerate(decoded):
+            nm, op, ins, outs, attrs = entry
+            if op != "Squeeze" or len(ins) != 2 or len(outs) != 1:
+                continue
+            s_out = outs[0]
+            if uses.get(s_out, 0) != 2:
+                continue
+            cidxs = consumers.get(s_out, [])
+            if len(cidxs) != 2:
+                continue
+            hs_idx, mul_idx = cidxs[0], cidxs[1]
+            if decoded[hs_idx][1] != "HardSigmoid" or decoded[mul_idx][1] != "Mul":
+                continue
+            hs_out = decoded[hs_idx][3][0]
+            if uses.get(hs_out, 0) != 1 or hs_out not in decoded[mul_idx][2]:
+                continue
+            mul_out = decoded[mul_idx][3][0]
+            # Verify Mul is only consumed once and either feeds Unsqueeze(same axes) or a 3D consumer.
+            if uses.get(mul_out, 0) != 1:
+                continue
+            mc_idx = consumers[mul_out][0]
+            axes_info = init_map.get(ins[1])
+            mc_node = decoded[mc_idx]
+            if mc_node[1] == "Unsqueeze" and len(mc_node[2]) == 2 and mc_node[3][0] not in graph_out_names:
+                u_axes = init_map.get(mc_node[2][1])
+                if axes_info and u_axes and decode_int64_list(axes_info[2]) == decode_int64_list(u_axes[2]):
+                    # Bypass Squeeze and Unsqueeze completely around HardSwish!
+                    decoded[hs_idx][2] = [ins[0]]
+                    decoded[mul_idx][2] = [hs_out if x == s_out else ins[0] for x in decoded[mul_idx][2]]
+                    u_out = mc_node[3][0]
+                    decoded = [n for i, n in enumerate(decoded) if i not in (idx, mc_idx)]
+                    for node in decoded:
+                        node[2] = [mul_out if x == u_out else x for x in node[2]]
+                    changed = True
+                    break
+            elif mc_node[1] == "Transpose":
+                # Move Squeeze after Mul so Conv -> HardSwish stays 4D before Transpose.
+                decoded[hs_idx][2] = [ins[0]]
+                decoded[mul_idx][2] = [hs_out if x == s_out else ins[0] for x in decoded[mul_idx][2]]
+                four_d_mul_out = f"{mul_out}__4d"
+                decoded[mul_idx][3] = [four_d_mul_out]
+                entry[2] = [four_d_mul_out, ins[1]]
+                entry[3] = [mul_out]
+                # Ensure topological order: Squeeze node must sit right after Mul.
+                sq_node = decoded.pop(idx)
+                new_mul_idx = next(i for i, n in enumerate(decoded) if n[3] == [four_d_mul_out])
+                decoded.insert(new_mul_idx + 1, sq_node)
+                changed = True
+                break
+
+    # 7. Prune unreferenced initializers.
+    referenced = {x for entry in decoded for x in entry[2]}
+    new_inits = [
+        encode_tensor(tname, dims, dt, raw)
+        for tname, (dims, dt, raw) in init_map.items()
+        if tname in referenced
+    ]
+    return [rebuild_node(e) for e in decoded], new_inits, outputs
+
+
 def quantize_weight_per_channel(
     name: str, dims: list[int], values: array, axis: int,
 ) -> tuple[bytes, bytes, bytes]:
@@ -364,12 +801,45 @@ def extract_dict_from_yml(yml_path: Path) -> list[str]:
     return chars
 
 
+def upgrade_squeeze_opset_13(
+    nodes: list[bytes],
+    initializers: list[bytes],
+) -> tuple[list[bytes], list[bytes]]:
+    upgraded_nodes = []
+    extra_axes_inits: list[bytes] = []
+    axes_counter = 0
+    for nb in nodes:
+        name, op, ins, outs, attrs = decode_node(nb)
+        if op in ("Squeeze", "Unsqueeze") and len(ins) == 1:
+            kept_attrs = []
+            axes_list: list[int] | None = None
+            for ab in attrs:
+                an, _, ints_val, _ = attr_name_and_info(ab)
+                if an == "axes" and ints_val:
+                    axes_list = ints_val
+                else:
+                    kept_attrs.append(ab)
+            if axes_list is not None:
+                axes_name = f"__opset13_axes_{axes_counter}"
+                axes_counter += 1
+                extra_axes_inits.append(
+                    encode_tensor(axes_name, [len(axes_list)], TENSOR_INT64, pack_int64_le(axes_list))
+                )
+                upgraded_nodes.append(make_node(op, [ins[0], axes_name], outs, kept_attrs, name=name))
+                continue
+        upgraded_nodes.append(nb)
+    return upgraded_nodes, initializers + extra_axes_inits
+
+
 def transform_model(
     source: Path,
     output: Path,
     quantize_weights: bool,
     replace_softmax_with_argmax: bool,
     prune_dicts: tuple[Path, Path] | None,
+    optimize_graph: bool = False,
+    confidence_mode: str = "softmax",
+    dynamic_quant_matmul: bool = False,
 ) -> None:
     model_fields = parse_fields(source.read_bytes())
     graph_bytes = next((v for f, w, v, _ in model_fields if f == 7 and w == 2), None)
@@ -392,7 +862,7 @@ def transform_model(
     initializers = [v for f, w, v, _ in graph_fields if f == 5 and w == 2]
     outputs = [v for f, w, v, _ in graph_fields if f == 12 and w == 2]
 
-    # Step A: Optional CJK class pruning (before weight quantization so linear_1 scales match pruned class count).
+    # Step A: Optional CJK class pruning (before folding/quantization so head weight shapes match raw graph).
     if prune_dicts is not None:
         dict_in_path, dict_out_path = prune_dicts
         orig_chars = dict_in_path.read_text(encoding="utf-8").splitlines()
@@ -441,7 +911,15 @@ def transform_model(
                 new_inits.append(ib)
         initializers = new_inits
 
-    # Step B: Keep Softmax internal; emit compact per-step max probability and token IDs.
+    needs_opset_13 = optimize_graph or quantize_weights or dynamic_quant_matmul
+    target_opset = max(current_opset, 13) if needs_opset_13 else current_opset
+    if needs_opset_13 and current_opset < 13:
+        nodes, initializers = upgrade_squeeze_opset_13(nodes, initializers)
+
+    if optimize_graph:
+        nodes, initializers, outputs = optimize_graph_structure(nodes, initializers, outputs)
+
+    # Step B: Emit compact per-step confidence and token IDs without transferring full vocabulary logits.
     if replace_softmax_with_argmax:
         output_names = {
             next(vv.decode("utf-8") for vf, vw, vv, _ in parse_fields(o) if vf == 1)
@@ -449,7 +927,8 @@ def transform_model(
         }
         rewritten_nodes = []
         replaced_axes: dict[str, int] = {}
-        reduce_axes_initializers: list[bytes] = []
+        extra_confidence_initializers: list[bytes] = []
+        topk_helper_names: tuple[str, str, str] | None = None
         for nb in nodes:
             name, op, ins, outs, attrs = decode_node(nb)
             if op == "Softmax" and len(outs) == 1 and outs[0] in output_names:
@@ -461,32 +940,95 @@ def transform_model(
                 token_output = outs[0] + "_argmax_tokens"
                 confidence_output = outs[0] + "_max_probability"
                 replaced_axes[outs[0]] = axis
-                rewritten_nodes.append(nb)
-                rewritten_nodes.append(make_node(
-                    "ArgMax", ins, [token_output],
-                    [make_int_attr("axis", axis), make_int_attr("keepdims", 0)],
-                    name=name.replace("Softmax", "ArgMax") if name else "",
-                ))
-                if current_opset >= 18:
-                    axes_name = f"__confidence_axes_{len(reduce_axes_initializers)}"
-                    reduce_axes_initializers.append(
-                        encode_tensor(axes_name, [1], TENSOR_INT64, pack_int64_le([axis]))
-                    )
-                    reduce_max_inputs = [outs[0], axes_name]
-                    reduce_attrs = [make_int_attr("keepdims", 0)]
+                if confidence_mode == "topk":
+                    if topk_helper_names is None:
+                        k_name = "__topk_k"
+                        idx0_name = "__topk_idx0"
+                        idx1_name = "__topk_idx1"
+                        extra_confidence_initializers.extend([
+                            encode_tensor(k_name, [1], TENSOR_INT64, pack_int64_le([2])),
+                            encode_tensor(idx0_name, [], TENSOR_INT64, pack_int64_le([0])),
+                            encode_tensor(idx1_name, [], TENSOR_INT64, pack_int64_le([1])),
+                        ])
+                        topk_helper_names = (k_name, idx0_name, idx1_name)
+                    k_name, idx0_name, idx1_name = topk_helper_names
+                    prefix = f"{outs[0]}__topk"
+                    topk_vals = f"{prefix}_vals"
+                    topk_idxs = f"{prefix}_idxs"
+                    top1_val = f"{prefix}_top1"
+                    top2_val = f"{prefix}_top2"
+                    margin = f"{prefix}_margin"
+                    rewritten_nodes.extend([
+                        make_node(
+                            "TopK",
+                            [ins[0], k_name],
+                            [topk_vals, topk_idxs],
+                            [make_int_attr("axis", axis), make_int_attr("largest", 1), make_int_attr("sorted", 1)],
+                            name=name.replace("Softmax", "TopK") if name else "",
+                        ),
+                        make_node(
+                            "Gather",
+                            [topk_idxs, idx0_name],
+                            [token_output],
+                            [make_int_attr("axis", axis)],
+                            name=name.replace("Softmax", "ArgMaxGather") if name else "",
+                        ),
+                        make_node(
+                            "Gather",
+                            [topk_vals, idx0_name],
+                            [top1_val],
+                            [make_int_attr("axis", axis)],
+                            name=name.replace("Softmax", "Top1Gather") if name else "",
+                        ),
+                        make_node(
+                            "Gather",
+                            [topk_vals, idx1_name],
+                            [top2_val],
+                            [make_int_attr("axis", axis)],
+                            name=name.replace("Softmax", "Top2Gather") if name else "",
+                        ),
+                        make_node(
+                            "Sub",
+                            [top1_val, top2_val],
+                            [margin],
+                            [],
+                            name=name.replace("Softmax", "MarginSub") if name else "",
+                        ),
+                        make_node(
+                            "Sigmoid",
+                            [margin],
+                            [confidence_output],
+                            [],
+                            name=name.replace("Softmax", "MarginSigmoid") if name else "",
+                        ),
+                    ])
                 else:
-                    reduce_max_inputs = [outs[0]]
-                    reduce_attrs = [make_int_attr("keepdims", 0), make_ints_attr("axes", [axis])]
-                rewritten_nodes.append(make_node(
-                    "ReduceMax", reduce_max_inputs, [confidence_output], reduce_attrs,
-                    name=name.replace("Softmax", "Confidence") if name else "",
-                ))
+                    rewritten_nodes.append(nb)
+                    rewritten_nodes.append(make_node(
+                        "ArgMax", ins, [token_output],
+                        [make_int_attr("axis", axis), make_int_attr("keepdims", 0)],
+                        name=name.replace("Softmax", "ArgMax") if name else "",
+                    ))
+                    if target_opset >= 18:
+                        axes_name = f"__confidence_axes_{len(extra_confidence_initializers)}"
+                        extra_confidence_initializers.append(
+                            encode_tensor(axes_name, [1], TENSOR_INT64, pack_int64_le([axis]))
+                        )
+                        reduce_max_inputs = [outs[0], axes_name]
+                        reduce_attrs = [make_int_attr("keepdims", 0)]
+                    else:
+                        reduce_max_inputs = [outs[0]]
+                        reduce_attrs = [make_int_attr("keepdims", 0), make_ints_attr("axes", [axis])]
+                    rewritten_nodes.append(make_node(
+                        "ReduceMax", reduce_max_inputs, [confidence_output], reduce_attrs,
+                        name=name.replace("Softmax", "Confidence") if name else "",
+                    ))
             else:
                 rewritten_nodes.append(nb)
         if not replaced_axes:
             raise ValueError("No output Softmax node found to replace with ArgMax")
         nodes = rewritten_nodes
-        initializers.extend(reduce_axes_initializers)
+        initializers.extend(extra_confidence_initializers)
         new_outputs = []
         for ob in outputs:
             oname = next(vv.decode("utf-8") for vf, vw, vv, _ in parse_fields(ob) if vf == 1)
@@ -514,36 +1056,99 @@ def transform_model(
                 new_outputs.append(ob)
         outputs = new_outputs
 
+    # Step B2: Optional dynamic INT8 MatMul lowering before Conv/Gemm DequantizeLinear packing.
+    if dynamic_quant_matmul:
+        init_decoded: dict[str, tuple[list[int], int, array | None]] = {}
+        for ib in initializers:
+            tname, dims, dt, vals = decode_tensor(ib)
+            init_decoded[tname] = (dims, dt, vals)
+        init_use_counts: dict[str, int] = {}
+        for nb in nodes:
+            _, _, ins, _, _ = decode_node(nb)
+            for x in ins:
+                if x in init_decoded:
+                    init_use_counts[x] = init_use_counts.get(x, 0) + 1
+
+        dq_quantized: dict[str, tuple[bytes, bytes, bytes]] = {}
+        removed_dq_inits: set[str] = set()
+        rewritten_nodes = []
+        dq_counter = 0
+        for nb in nodes:
+            name, op, ins, outs, _ = decode_node(nb)
+            if op == "MatMul" and len(ins) == 2 and len(outs) == 1 and ins[1] in init_decoded:
+                wname = ins[1]
+                dims, dt, vals = init_decoded[wname]
+                if dt == TENSOR_FLOAT and len(dims) == 2 and vals is not None:
+                    if wname not in dq_quantized:
+                        init_q, init_s, _ = quantize_weight_per_channel(wname, dims, vals, -1)
+                        init_z = encode_tensor(f"{wname}_dqzero", [], TENSOR_INT8, b"\x00")
+                        dq_quantized[wname] = (init_q, init_s, init_z)
+                        if init_use_counts.get(wname, 0) <= 1:
+                            removed_dq_inits.add(wname)
+                    else:
+                        # Decrement if used by another MatMul; keep original initializer if any non-MatMul uses it.
+                        pass
+                    prefix = f"{outs[0]}__dq_{dq_counter}"
+                    dq_counter += 1
+                    rewritten_nodes.extend([
+                        make_node(
+                            "DynamicQuantizeLinear",
+                            [ins[0]],
+                            [f"{prefix}_u8", f"{prefix}_xs", f"{prefix}_xz"],
+                            [],
+                            name=f"{name}__dql" if name else "",
+                        ),
+                        make_node(
+                            "MatMulInteger",
+                            [f"{prefix}_u8", f"{wname}_int8", f"{prefix}_xz", f"{wname}_dqzero"],
+                            [f"{prefix}_i32"],
+                            [],
+                            name=f"{name}__mmi" if name else "",
+                        ),
+                        make_node(
+                            "Cast",
+                            [f"{prefix}_i32"],
+                            [f"{prefix}_f32"],
+                            [make_int_attr("to", TENSOR_FLOAT)],
+                            name=f"{name}__cast" if name else "",
+                        ),
+                        make_node(
+                            "Mul",
+                            [f"{prefix}_xs", f"{wname}_scale"],
+                            [f"{prefix}_scale"],
+                            [],
+                            name=f"{name}__mul_scale" if name else "",
+                        ),
+                        make_node(
+                            "Mul",
+                            [f"{prefix}_f32", f"{prefix}_scale"],
+                            outs,
+                            [],
+                            name=name,
+                        ),
+                    ])
+                    continue
+            rewritten_nodes.append(nb)
+
+        if dq_quantized:
+            nodes = rewritten_nodes
+            remaining_uses = {
+                x
+                for nb in nodes
+                for x in decode_node(nb)[2]
+                if x in init_decoded
+            }
+            kept_inits = [
+                ib
+                for ib in initializers
+                if decode_tensor_raw(ib)[0] not in removed_dq_inits or decode_tensor_raw(ib)[0] in remaining_uses
+            ]
+            for iq, isc, iz in dq_quantized.values():
+                kept_inits.extend([iq, isc, iz])
+            initializers = kept_inits
+
     # Step C: Per-output-channel INT8 weight storage + DequantizeLinear (opset >= 13).
-    target_opset = current_opset
     if quantize_weights:
-        target_opset = max(current_opset, 13)
-        if current_opset < 13:
-            upgraded_nodes = []
-            extra_axes_inits: list[bytes] = []
-            axes_counter = 0
-            for nb in nodes:
-                name, op, ins, outs, attrs = decode_node(nb)
-                if op in ("Squeeze", "Unsqueeze") and len(ins) == 1:
-                    kept_attrs = []
-                    axes_list: list[int] | None = None
-                    for ab in attrs:
-                        an, _, ints_val, _ = attr_name_and_info(ab)
-                        if an == "axes" and ints_val:
-                            axes_list = ints_val
-                        else:
-                            kept_attrs.append(ab)
-                    if axes_list is not None:
-                        axes_name = f"__opset13_axes_{axes_counter}"
-                        axes_counter += 1
-                        extra_axes_inits.append(
-                            encode_tensor(axes_name, [len(axes_list)], TENSOR_INT64, pack_int64_le(axes_list))
-                        )
-                        upgraded_nodes.append(make_node(op, [ins[0], axes_name], outs, kept_attrs, name=name))
-                        continue
-                upgraded_nodes.append(nb)
-            nodes = upgraded_nodes
-            initializers.extend(extra_axes_inits)
 
         candidates: dict[str, int] = {}
         for nb in nodes:
@@ -625,7 +1230,8 @@ def transform_model(
                 kept_inits.append(init_by_name[tname])
         initializers = kept_inits
 
-    # Rebuild GraphProto preserving field order semantics.
+    # Rebuild GraphProto preserving field order semantics (drop stale value_info when graph topology or outputs changed).
+    strip_value_info = optimize_graph or replace_softmax_with_argmax or dynamic_quant_matmul or (prune_dicts is not None)
     rebuilt_graph = []
     nodes_written = False
     inits_written = False
@@ -643,6 +1249,8 @@ def transform_model(
             if not outputs_written:
                 rebuilt_graph.extend(encode_field_bytes(12, o) for o in outputs)
                 outputs_written = True
+        elif f == 13 and strip_value_info:
+            continue
         else:
             rebuilt_graph.append(raw)
     if not nodes_written:
@@ -654,13 +1262,14 @@ def transform_model(
     new_graph_bytes = b"".join(rebuilt_graph)
 
     # Rebuild ModelProto.
+    upgrade_model_header = (target_opset > current_opset) or quantize_weights or dynamic_quant_matmul
     rebuilt_model = []
     for f, w, v, raw in model_fields:
-        if f == 1 and w == 0 and quantize_weights and isinstance(v, int):
+        if f == 1 and w == 0 and upgrade_model_header and isinstance(v, int):
             rebuilt_model.append(encode_field_varint(1, max(v, 7)))
         elif f == 7 and w == 2:
             rebuilt_model.append(encode_field_bytes(7, new_graph_bytes))
-        elif f == 8 and w == 2 and quantize_weights:
+        elif f == 8 and w == 2 and upgrade_model_header:
             assert isinstance(v, bytes)
             op_fields = parse_fields(v)
             dom = next((ov.decode("utf-8") for of, ow, ov, _ in op_fields if of == 1 and ow == 2), "")
@@ -688,9 +1297,25 @@ def main() -> None:
         help="Store 2D+ Conv/MatMul weights as per-output-channel INT8 with DequantizeLinear.",
     )
     parser.add_argument(
+        "--optimize-graph",
+        action="store_true",
+        help="Eliminate Identity, cancel redundant Transpose/Squeeze pairs, fold Conv/ConvTranspose biases and BatchNorm.",
+    )
+    parser.add_argument(
         "--replace-softmax-with-argmax",
         action="store_true",
-        help="Emit INT64 ArgMax tokens and compact per-step max-Softmax confidence for greedy CTC decoding.",
+        help="Emit INT64 ArgMax tokens and compact per-step confidence for greedy CTC decoding.",
+    )
+    parser.add_argument(
+        "--confidence-mode",
+        choices=["softmax", "topk"],
+        default="softmax",
+        help="Compute compact confidence via Softmax+ReduceMax or TopK top-2 logit margin.",
+    )
+    parser.add_argument(
+        "--dynamic-quant-matmul",
+        action="store_true",
+        help="Rewrite constant-weight FP32 MatMul ops to DynamicQuantizeLinear + MatMulInteger.",
     )
     parser.add_argument(
         "--prune-non-cjk",
@@ -726,6 +1351,9 @@ def main() -> None:
         quantize_weights=args.quantize_weights,
         replace_softmax_with_argmax=args.replace_softmax_with_argmax,
         prune_dicts=tuple(args.prune_non_cjk) if args.prune_non_cjk else None,
+        optimize_graph=args.optimize_graph,
+        confidence_mode=args.confidence_mode,
+        dynamic_quant_matmul=args.dynamic_quant_matmul,
     )
 
 

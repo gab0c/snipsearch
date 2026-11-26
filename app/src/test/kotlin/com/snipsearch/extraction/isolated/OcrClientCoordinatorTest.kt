@@ -61,7 +61,7 @@ class OcrClientCoordinatorTest {
         val before = files()
         val context = FakeOcrServiceContext(application)
         val coordinator = OcrClientCoordinator(context)
-        val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
         try {
             val warmInfo = runBlocking { coordinator.warmUp() }
             assertFalse(warmInfo.reused)
@@ -102,11 +102,33 @@ class OcrClientCoordinatorTest {
     }
 
     @Test
+    fun cropPixelsBulkZeroesMultiChunkSharedMemoryOnClose() {
+        val large = Bitmap.createBitmap(128, 64, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
+        try {
+            val pixels = OcrClientCoordinator.CropPixels.copy(large)!!
+            val mapping = pixels.memory.mapReadOnly()
+            try {
+                val ints = mapping.order(ByteOrder.nativeOrder()).asIntBuffer()
+                assertEquals(Color.RED, ints.get(0))
+                assertEquals(Color.RED, ints.get(128 * 64 - 1))
+                pixels.close()
+                for (i in 0 until ints.capacity()) {
+                    assertEquals(0, ints.get(i))
+                }
+            } finally {
+                SharedMemory.unmap(mapping)
+            }
+        } finally {
+            large.recycle()
+        }
+    }
+
+    @Test
     fun binderDeathReleasesTheBindingAndNextRequestUsesANewServiceWithoutAppFiles() {
         val before = files()
         val context = FakeOcrServiceContext(application, dieOnBindingNumber = 1)
         val coordinator = OcrClientCoordinator(context)
-        val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
         try {
             assertThrows(DeadObjectException::class.java) { runBlocking { coordinator.recognize(crop) } }
             assertEquals(1, context.bindings)
@@ -136,7 +158,7 @@ class OcrClientCoordinatorTest {
             waitBeforeFinish = releaseRecognize,
         )
         val coordinator = OcrClientCoordinator(context)
-        val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val crop = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
         try {
             val detectedCount = AtomicInteger(0)
             val pixels = OcrClientCoordinator.CropPixels.copy(crop)!!
@@ -207,7 +229,7 @@ class OcrClientCoordinatorTest {
             clock = { clockMs },
             logger = { logs += it },
         )
-        val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
         try {
             val scanId = runner.nextScanId()
             clockMs = 120L
@@ -239,7 +261,7 @@ class OcrClientCoordinatorTest {
         val context = FakeOcrServiceContext(application, emitDetectCallback = true)
         val coordinator = OcrClientCoordinator(context)
         val runner = SessionOcrRunner(coordinator)
-        val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.MAGENTA) }
+        val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
         val logs = mutableListOf<String>()
         val timing = OcrTiming.start(1, logger = { logs += it })
         try {
@@ -303,7 +325,7 @@ class OcrClientCoordinatorTest {
                 ): List<OcrTextBlockParcelable> {
                     val mapping = argbPixels.mapReadOnly()
                     try {
-                        assertEquals(Color.MAGENTA, mapping.order(ByteOrder.nativeOrder()).getInt(0))
+                        assertEquals(Color.RED, mapping.order(ByteOrder.nativeOrder()).getInt(0))
                     } finally {
                         SharedMemory.unmap(mapping)
                     }
