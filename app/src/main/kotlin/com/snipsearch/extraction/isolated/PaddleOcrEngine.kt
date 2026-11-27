@@ -145,6 +145,10 @@ internal class PaddleOcrEngine private constructor(
         input: FloatBuffer,
         scratch: DirectFloatScratch,
     ) {
+        if (width == detWidth && height == detHeight) {
+            AlignedDetectorInput.fill(argb, width, height, stride, input, scratch, DET_SCALE, DET_BIAS)
+            return
+        }
         val plane = detWidth * detHeight
         val x0Table = IntArray(detWidth)
         val x1Table = IntArray(detWidth)
@@ -474,7 +478,9 @@ internal class PaddleOcrEngine private constructor(
                 }
             }
         } finally {
-            scratch.scrub(floatCount)
+            // The previous inference already scrubbed unused retained capacity. Only these
+            // row prefixes can have been populated by this inference, including on failure.
+            scratch.scrub(floatCount, usedRowWidth = width)
         }
     }
 
