@@ -12,7 +12,7 @@ SnipSearch has not been released yet. Once releases exist, this section will sta
 
 ## OCR security model
 
-The intended architecture runs bundled PP-OCRv6 Tiny / ONNX Runtime inference in the main app process on background workers. OCR isolation is no longer a required security boundary. The current code still contains the legacy isolated service; replacing it is a pending implementation task, not a completed runtime change. See [`docs/plan.md`](docs/plan.md) §4.3.
+Bundled PP-OCRv6 Tiny / ONNX Runtime inference runs in the main app process on background workers. OCR isolation is not a security boundary. See [`docs/plan.md`](docs/plan.md) §4.3.
 
 OCR shares the app's UID, permissions, and address space. A native OCR crash can terminate the app, and a native-code compromise can gain app-process privileges. We accept the loss of separate-process containment; we do not claim OCR has an independently enforced network or storage sandbox. This change does not alter Android's normal app sandbox or system WebView isolation.
 

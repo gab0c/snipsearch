@@ -16,7 +16,7 @@ internal class OcrTiming private constructor(
     private val logger: (String) -> Unit,
 ) {
     private val assistLogged = AtomicBoolean(false)
-    private val serviceReadyLogged = AtomicBoolean(false)
+    private val engineReadyLogged = AtomicBoolean(false)
     private val firstSelectableLogged = AtomicBoolean(false)
     private val firstOcrSelectableLogged = AtomicBoolean(false)
 
@@ -38,9 +38,9 @@ internal class OcrTiming private constructor(
         }
     }
 
-    fun logServiceReady(bindMs: Long, initMs: Long, reused: Boolean) {
-        if (serviceReadyLogged.compareAndSet(false, true)) {
-            logger("id=$invocationId event=service_ready +${elapsedMs()}ms bindMs=${bindMs}ms initMs=${initMs}ms reused=$reused")
+    fun logEngineReady(initMs: Long, reused: Boolean) {
+        if (engineReadyLogged.compareAndSet(false, true)) {
+            logger("id=$invocationId event=ocr_engine_ready +${elapsedMs()}ms initMs=${initMs}ms reused=$reused")
         }
     }
 

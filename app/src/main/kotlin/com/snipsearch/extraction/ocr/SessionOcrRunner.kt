@@ -1,4 +1,4 @@
-package com.snipsearch.extraction.isolated
+package com.snipsearch.extraction.ocr
 
 import android.graphics.Bitmap
 import com.snipsearch.extraction.OcrLine
@@ -23,7 +23,7 @@ internal data class OcrScanSnapshot(
     val status: Status = Status.IDLE,
     val lines: List<OcrLine> = emptyList(),
     val detectedRegionCount: Int? = null,
-    val reusedService: Boolean = false,
+    val reusedEngine: Boolean = false,
 ) {
     enum class Status {
         IDLE,
@@ -39,13 +39,15 @@ internal data class OcrScanSnapshot(
 
 /**
  * Coordinates assistant-session warm-up, early RAM-only pixel copying, atomic
- * OCR results, and synchronous cancellation before the session scrubs or
- * recycles its capture [Bitmap].
+ * OCR results and takes RAM pixel ownership before returning from [startScan],
+ * so the session can immediately scrub or recycle its capture [Bitmap].
  */
 internal class SessionOcrRunner(
-    private val coordinator: OcrClientCoordinator,
+    private val coordinator: OcrCoordinator,
     private val workerDispatcher: CoroutineDispatcher = Dispatchers.Default,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val pixelCopier: (Bitmap, () -> Boolean) -> OcrCoordinator.CropPixels? = { bitmap, cancelled ->
+        OcrCoordinator.CropPixels.copy(bitmap, cancelled)
+    },
 ) {
     private val scope = CoroutineScope(SupervisorJob() + workerDispatcher)
     private val stateLock = Any()
@@ -57,43 +59,69 @@ internal class SessionOcrRunner(
 
     private var warmJob: Job? = null
     private var activeScan: ActiveScan? = null
+    @Volatile private var destroyed = false
 
     fun nextScanId(): Long = nextScanIdGenerator.incrementAndGet()
 
     fun warmUp(timing: OcrTiming? = null) {
         synchronized(stateLock) {
+            if (destroyed) return
+            coordinator.retainModels()
             if (warmJob?.isActive == true) return
-            warmJob = scope.launch(ioDispatcher) {
+            warmJob = scope.launch(workerDispatcher) {
                 try {
-                    val ready = coordinator.warmUp()
-                    timing?.logServiceReady(ready.bindMs, ready.initMs, ready.reused)
+                    val ready = coordinator.warmUp(cancelIdleRelease = false)
+                    timing?.logEngineReady(ready.initMs, ready.reused)
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (_: Exception) {
-                    // Explicit OCR scan handles and surfaces service startup errors.
+                    // Explicit OCR scan handles initialization errors and fallback.
+                } catch (_: LinkageError) {
+                    // A missing/incompatible native runtime is recoverable through assist fallback.
                 }
             }
         }
     }
 
     fun startScan(scanId: Long, bitmap: Bitmap, timing: OcrTiming? = null) {
-        val previous: ActiveScan?
         val current = ActiveScan(scanId)
-        val job = scope.launch(workerDispatcher, start = CoroutineStart.LAZY) {
-            runScan(current, bitmap, timing)
-        }
-        current.job = job
-        synchronized(stateLock) {
-            previous = activeScan
-            previous?.cancelled?.set(true)
+        val previous = synchronized(stateLock) {
+            if (destroyed) return
+            coordinator.retainModels()
+            val prev = activeScan
+            prev?.cancelled?.set(true)
             activeScan = current
-            _state.value = OcrScanSnapshot(
-                scanId = scanId,
-                status = OcrScanSnapshot.Status.RUNNING,
-                lines = emptyList(),
-            )
+            _state.value = OcrScanSnapshot(scanId = scanId, status = OcrScanSnapshot.Status.RUNNING)
+            prev
         }
         previous?.job?.cancel()
+        // Own screen pixels before yielding; no worker closure retains the source Bitmap.
+        val scanStartNanos = System.nanoTime()
+        val pixels = try {
+            synchronized(pixelCopyLock) {
+                if (current.cancelled.get() || destroyed || bitmap.isRecycled) null
+                else pixelCopier(bitmap) { current.cancelled.get() }
+            }
+        } catch (_: Exception) {
+            null
+        }
+        if (pixels == null) {
+            publishIfCurrent(current) { it.copy(status = OcrScanSnapshot.Status.FAILED, lines = emptyList()) }
+            return
+        }
+        timing?.logPixelsCopied((System.nanoTime() - scanStartNanos) / 1_000_000L, pixels.width, pixels.height)
+        val job = scope.launch(workerDispatcher, start = CoroutineStart.LAZY) {
+            runScan(current, pixels, timing, scanStartNanos)
+        }
+        // Covers cancellation before the lazy job enters its body as well as normal completion.
+        job.invokeOnCompletion { pixels.close() }
+        current.job = job
+        synchronized(stateLock) {
+            if (destroyed || activeScan !== current || current.cancelled.get()) {
+                job.cancel()
+                return
+            }
+        }
         job.start()
     }
 
@@ -107,7 +135,7 @@ internal class SessionOcrRunner(
         }
         previous?.job?.cancel()
         synchronized(pixelCopyLock) {
-            // Wait for any in-flight Bitmap pixel copy to finish before caller recycles bitmap.
+            // Wait only for RAM ownership transfer, never for native inference.
         }
     }
 
@@ -118,6 +146,8 @@ internal class SessionOcrRunner(
 
     fun onSessionDestroy() {
         synchronized(stateLock) {
+            if (destroyed) return
+            destroyed = true
             warmJob?.cancel()
             warmJob = null
         }
@@ -126,72 +156,56 @@ internal class SessionOcrRunner(
         scope.cancel()
     }
 
-    private suspend fun runScan(scan: ActiveScan, bitmap: Bitmap, timing: OcrTiming?) {
-        val scanStartNanos = System.nanoTime()
-        val pixels = try {
-            synchronized(pixelCopyLock) {
-                if (scan.cancelled.get() || bitmap.isRecycled) {
-                    null
-                } else {
-                    val copyStartNanos = System.nanoTime()
-                    val copied = OcrClientCoordinator.CropPixels.copy(bitmap) { scan.cancelled.get() }
-                    if (copied != null) {
-                        val copyMs = (System.nanoTime() - copyStartNanos) / 1_000_000L
-                        timing?.logPixelsCopied(copyMs, copied.width, copied.height)
-                    }
-                    copied
-                }
-            }
-        } catch (cancellation: CancellationException) {
-            throw cancellation
-        } catch (_: Exception) {
-            publishIfCurrent(scan) {
-                it.copy(status = OcrScanSnapshot.Status.FAILED, lines = emptyList())
-            }
-            return
-        }
-
-        if (pixels == null || scan.cancelled.get()) {
-            pixels?.close()
+    private suspend fun runScan(
+        scan: ActiveScan,
+        pixels: OcrCoordinator.CropPixels,
+        timing: OcrTiming?,
+        scanStartNanos: Long,
+    ) {
+        if (scan.cancelled.get()) {
+            pixels.close()
             return
         }
 
         pixels.use { cropPixels ->
-            var reusedService = false
+            var reusedEngine = false
             try {
                 val finalLines = coordinator.recognize(
                     pixels = cropPixels,
                     onReady = { info ->
-                        reusedService = info.reused
-                        timing?.logServiceReady(info.bindMs, info.initMs, info.reused)
+                        reusedEngine = info.reused
+                        timing?.logEngineReady(info.initMs, info.reused)
                     },
                     onDetect = { count, detMs ->
                         timing?.logDetectDone(detMs, count)
                         publishIfCurrent(scan) { it.copy(detectedRegionCount = count) }
                     },
+                    isCancelled = { scan.cancelled.get() },
                 )
                 if (!scan.cancelled.get()) {
                     val totalOcrMs = (System.nanoTime() - scanStartNanos) / 1_000_000L
                     val wordCount = finalLines.sumOf { it.words.size }
-                    timing?.logOcrComplete(totalOcrMs, finalLines.size, wordCount, reusedService)
+                    timing?.logOcrComplete(totalOcrMs, finalLines.size, wordCount, reusedEngine)
                     publishIfCurrent(scan) {
                         it.copy(
                             status = OcrScanSnapshot.Status.COMPLETE,
                             lines = finalLines,
-                            reusedService = reusedService,
+                            reusedEngine = reusedEngine,
                         )
                     }
                 }
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (_: Exception) {
-                if (!scan.cancelled.get()) {
-                    publishIfCurrent(scan) {
-                        it.copy(status = OcrScanSnapshot.Status.FAILED, lines = emptyList())
-                    }
-                }
+                publishFailureIfCurrent(scan)
+            } catch (_: LinkageError) {
+                publishFailureIfCurrent(scan)
             }
         }
+    }
+
+    private fun publishFailureIfCurrent(scan: ActiveScan) {
+        publishIfCurrent(scan) { it.copy(status = OcrScanSnapshot.Status.FAILED, lines = emptyList()) }
     }
 
     private inline fun publishIfCurrent(

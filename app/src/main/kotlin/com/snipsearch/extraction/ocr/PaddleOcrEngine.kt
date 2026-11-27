@@ -1,4 +1,4 @@
-package com.snipsearch.extraction.isolated
+package com.snipsearch.extraction.ocr
 
 import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
@@ -6,7 +6,9 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.res.AssetFileDescriptor
 import android.util.Log
-import com.snipsearch.ipc.OcrTextBlockParcelable
+import com.snipsearch.extraction.OcrLine
+import com.snipsearch.extraction.OcrWord
+import com.snipsearch.extraction.PixelRegion
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -36,15 +38,15 @@ internal class PaddleOcrEngine private constructor(
     private val detRegionScratch: TextDetectorScratch,
     private val recScratches: Array<DirectFloatScratch>,
     private val recExecutor: ExecutorService,
-) : AutoCloseable {
-    fun recognize(
+) : OcrEngine {
+    override fun recognize(
         argb: IntBuffer,
         width: Int,
         height: Int,
         stride: Int,
-        isCancelled: () -> Boolean = { false },
-        onDetected: (regionCount: Int, detectMs: Long) -> Unit = { _, _ -> },
-    ): List<OcrTextBlockParcelable> {
+        isCancelled: () -> Boolean,
+        onDetected: (regionCount: Int, detectMs: Long) -> Unit,
+    ): List<OcrLine> {
         if (isCancelled()) return emptyList()
         val detStartNanos = System.nanoTime()
         val scale = minOf(1.0, DET_MAX_SIDE / maxOf(width, height))
@@ -70,7 +72,7 @@ internal class PaddleOcrEngine private constructor(
         if (regions.isEmpty() || isCancelled()) return emptyList()
 
         val recognizers = awaitRecognizers(isCancelled) ?: return emptyList()
-        val results = arrayOfNulls<OcrTextBlockParcelable>(regions.size)
+        val results = arrayOfNulls<OcrLine>(regions.size)
         if (regions.size == 1 || recognizers.size <= 1) {
             val image = CropImage(argb.duplicate(), width, height, stride)
             val session = recognizers[0]
@@ -145,6 +147,10 @@ internal class PaddleOcrEngine private constructor(
         input: FloatBuffer,
         scratch: DirectFloatScratch,
     ) {
+        if (width == detWidth && height == detHeight) {
+            AlignedDetectorInput.fill(argb, width, height, stride, input, scratch, DET_SCALE, DET_BIAS)
+            return
+        }
         val plane = detWidth * detHeight
         val x0Table = IntArray(detWidth)
         val x1Table = IntArray(detWidth)
@@ -242,7 +248,7 @@ internal class PaddleOcrEngine private constructor(
         region: TextRegion,
         scaleX: Double,
         scaleY: Double,
-    ): OcrTextBlockParcelable? {
+    ): OcrLine? {
         val height = 48
         val contentWidth = ceil(height * region.aspectRatio(scaleX, scaleY)).toInt().coerceIn(16, REC_MAX_WIDTH)
         // PP-OCRv6_tiny_rec has exact horizontal stride 8 (3x stride-2 downsamples).
@@ -277,38 +283,27 @@ internal class PaddleOcrEngine private constructor(
             inputBuffer.position(0)
             inputBuffer.get(planar, 0, floatCount)
             val refinedSpans = WordBoundsRefiner.refine(planar, width, contentWidth, height, steps, words)
-            val starts = IntArray(words.size)
-            val ends = IntArray(words.size)
-            val bounds = IntArray(words.size * 4)
-            val text = buildString {
-                words.forEachIndexed { index, word ->
-                    if (index > 0) append(' ')
-                    starts[index] = length
-                    append(word.text)
-                    ends[index] = length
-                    val span = refinedSpans[index]
-                    val box = region.bounds(
-                        start = span.hStart,
-                        end = span.hEnd,
-                        scaleX = scaleX,
-                        scaleY = scaleY,
-                        width = image.width,
-                        height = image.height,
-                        vStart = span.vStart,
-                        vEnd = span.vEnd,
-                    )
-                    bounds[index * 4] = box.left
-                    bounds[index * 4 + 1] = box.top
-                    bounds[index * 4 + 2] = box.right
-                    bounds[index * 4 + 3] = box.bottom
-                }
+            val text = StringBuilder()
+            val outputWords = ArrayList<OcrWord>(words.size)
+            words.forEachIndexed { index, word ->
+                if (index > 0) text.append(' ')
+                val start = text.length
+                text.append(word.text)
+                val end = text.length
+                val span = refinedSpans[index]
+                val box = region.bounds(
+                    start = span.hStart,
+                    end = span.hEnd,
+                    scaleX = scaleX,
+                    scaleY = scaleY,
+                    width = image.width,
+                    height = image.height,
+                    vStart = span.vStart,
+                    vEnd = span.vEnd,
+                )
+                if (box.width > 0 && box.height > 0) outputWords += OcrWord(start until end, box)
             }
-            OcrTextBlockParcelable().apply {
-                this.text = text
-                wordStarts = starts
-                wordEnds = ends
-                wordBounds = bounds
-            }
+            assembleOcrLine(text.toString(), outputWords)
         }
     }
 
@@ -474,7 +469,9 @@ internal class PaddleOcrEngine private constructor(
                 }
             }
         } finally {
-            scratch.scrub(floatCount)
+            // The previous inference already scrubbed unused retained capacity. Only these
+            // row prefixes can have been populated by this inference, including on failure.
+            scratch.scrub(floatCount, usedRowWidth = width)
         }
     }
 

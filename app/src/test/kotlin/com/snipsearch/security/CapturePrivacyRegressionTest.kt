@@ -74,6 +74,20 @@ class CapturePrivacyRegressionTest {
         }.toList()
         assertTrue(hits.joinToString("\n"), hits.isEmpty())
     }
+
+    @Test
+    fun ocrHasNoNetworkOrIpcBoundaryAndRunsWithoutAnOcrService() {
+        val root = file("src/main/kotlin/com/snipsearch/extraction/ocr").parentFile
+        val ocrSources = File(root, "ocr").walkTopDown().filter { it.extension == "kt" }
+        val forbidden = listOf("HttpsURLConnection", "HttpURLConnection", "Socket(", "WebView", "SharedMemory", "Binder")
+        val hits = ocrSources.flatMap { source ->
+            val text = source.readText()
+            forbidden.filter(text::contains).map { "${source.path}:$it" }
+        }.toList()
+        assertTrue(hits.joinToString("\n"), hits.isEmpty())
+        assertFalse(file("src/main/AndroidManifest.xml").readText().contains("OcrIsolatedService"))
+        assertFalse(file("src/main/aidl").exists())
+    }
 }
 
 private fun file(relative: String): File {

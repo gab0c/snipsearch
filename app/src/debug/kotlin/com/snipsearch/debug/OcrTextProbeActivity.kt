@@ -141,7 +141,7 @@ class OcrTextProbeActivity : Activity() {
             "Tracking reference ZX94812045",
             "Download archive from status.example.net",
             "Verify checksum before deployment",
-            "Local isolated process execution active",
+            "Local in-process OCR execution active",
             "GrapheneOS memory tagging enabled",
             "Quick Settings tile screenshot path",
             "Primary selection handles stay anchored",

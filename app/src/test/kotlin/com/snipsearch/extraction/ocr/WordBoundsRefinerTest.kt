@@ -1,4 +1,4 @@
-package com.snipsearch.extraction.isolated
+package com.snipsearch.extraction.ocr
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
