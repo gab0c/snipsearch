@@ -8,7 +8,7 @@ import kotlin.math.ceil
 import kotlin.math.floor
 
 /** Fits the complete image into the overlay even when the session has different insets. */
-internal class CropViewport(val image: IntSize, canvas: IntSize) {
+internal class CropViewport(val image: IntSize, val canvas: IntSize) {
     val scale = minOf(canvas.width.toFloat() / image.width, canvas.height.toFloat() / image.height)
     val offset = Offset(
         (canvas.width - image.width * scale) / 2,

@@ -22,6 +22,13 @@
     <string name="overlay_copy_qr">Copy QR code</string>
     <string name="overlay_copy_barcode">Copy barcode</string>
     <string name="overlay_copy_text">Copy text</string>
+    <string name="overlay_search_text">Search</string>
+    <string name="overlay_google_results">Google results</string>
+    <string name="overlay_hide_results">Hide</string>
+    <string name="overlay_show_results">Show results</string>
+    <string name="overlay_open_browser">Open Google in browser</string>
     <string name="overlay_clip_label">SnipSearch selection</string>
     <string name="overlay_no_action_app">No app could open this selection</string>
+    <string name="overlay_search_unavailable">Search is unavailable in the app. You can open Google in your browser.</string>
+    <string name="overlay_results_drag_tab">Drag search results between full screen and three-fifths height</string>
 </resources>

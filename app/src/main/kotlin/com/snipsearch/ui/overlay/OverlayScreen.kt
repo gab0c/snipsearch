@@ -7,6 +7,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.view.Display
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,7 +18,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.safeDrawing
@@ -47,11 +50,14 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.geometry.Offset
 import androidx.core.graphics.createBitmap
 import com.snipsearch.R
 import com.snipsearch.extraction.AssistStructureParser
@@ -112,6 +118,7 @@ internal fun OverlayScreen(
     var localFullScanId by remember(screenshot) { mutableLongStateOf(0L) }
     var retryFullScanId by remember(screenshot) { mutableLongStateOf(0L) }
     var cropScanId by remember { mutableLongStateOf(0L) }
+    val search = rememberTextSearchSession()
 
     DisposableEffect(Unit) {
         onDispose { locked?.bitmap?.scrubAndRecycle() }
@@ -161,6 +168,7 @@ internal fun OverlayScreen(
             }
             val ocrComplete = useInitialCropLines || (matchesScan &&
                 (scanState.status == OcrScanSnapshot.Status.COMPLETE || scanState.status == OcrScanSnapshot.Status.FAILED))
+            LaunchedEffect(ocrComplete) { if (ocrComplete) search.warm() }
             val ocrFailed = !useInitialCropLines && matchesScan && scanState.status == OcrScanSnapshot.Status.FAILED
 
             val onRetryOcr = {
@@ -194,6 +202,7 @@ internal fun OverlayScreen(
                         ocrFailed = ocrFailed,
                         codes = codes.orEmpty(),
                         timing = null,
+                        search = search,
                         onRetryOcr = onRetryOcr,
                         onDismiss = onDismiss,
                     )
@@ -267,6 +276,7 @@ internal fun OverlayScreen(
                         ocrFailed = ocrFailed,
                         codes = emptyList(),
                         timing = timing,
+                        search = search,
                         onRetryOcr = onRetryOcr,
                         onDismiss = onDismiss,
                         onImageMode = { imageMode = true },
@@ -275,7 +285,8 @@ internal fun OverlayScreen(
             }
             BorderGlow(ocrLoading, Modifier.fillMaxSize())
         }
-        Surface(
+        if (search.isOpen) TextSearchPane(search, onDismiss, Modifier.align(Alignment.BottomCenter))
+        if (!search.isOpen) Surface(
             modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(12.dp),
             shape = MaterialTheme.shapes.extraLarge,
         ) {
@@ -297,10 +308,13 @@ private fun BoxScope.TextSelection(
     ocrFailed: Boolean,
     codes: List<DetectedEntity>,
     timing: OcrTiming?,
+    search: TextSearchSession,
     onRetryOcr: () -> Unit,
     onDismiss: () -> Unit,
     onImageMode: (() -> Unit)? = null,
 ) {
+    val context = LocalContext.current
+    val clipLabel = stringResource(R.string.overlay_clip_label)
     val imageBounds = viewport.imageBounds
     val screenCrop = region.mapBetween(imageBounds, screen)
     var assist by remember(bitmap, structures, screenCrop, displayId) {
@@ -360,27 +374,50 @@ private fun BoxScope.TextSelection(
         }
     }
     var selection by remember(resolvedOptions?.words?.map { it.bounds }) { mutableStateOf<IntRange?>(null) }
+    var activeHandle by remember(resolvedOptions?.words?.map { it.bounds }) { mutableStateOf(SelectionHandle.END) }
     val selected = if (resolvedOptions == null) "" else selectedText(resolvedOptions.blocks, resolvedOptions.words, selection)
     val entities = remember(codes, selected) { (codes + EntityAndQrDetector.extract(selected)).distinct() }
     if (resolvedOptions?.words?.isNotEmpty() == true) {
-        SelectableTextLayer(resolvedOptions.words, viewport, screen, selection, { selection = it }, Modifier.fillMaxSize())
+        SelectableTextLayer(resolvedOptions.words, viewport, screen, selection, { selection = it }, Modifier.fillMaxSize(),
+            onActiveHandle = { activeHandle = it })
     }
-    OverlayCard(Modifier.align(Alignment.BottomCenter)) {
-        val message = when {
+    if (selected.isNotEmpty() && resolvedOptions != null && !search.isOpen) {
+        val rects = resolvedOptions.words.map { viewport.toCanvas(it.bounds.mapBetween(screen, viewport.imageBounds)) }
+        val endpoint = activeSelectionHandle(resolvedOptions.words, rects, selection, activeHandle)
+        val density = LocalDensity.current
+        var toolbarSize by remember { mutableStateOf(IntSize.Zero) }
+        val gap = with(density) { 8.dp.toPx() }
+        val inset = with(density) { 12.dp.toPx() }
+        val insets = WindowInsets.safeDrawing
+        // Keep the bubble clear of the session Close control.
+        val topInset = insets.getTop(density) + with(density) { 60.dp.toPx() }
+        val bottomInset = insets.getBottom(density).toFloat()
+        // Anchor to the permanent Search/Copy pair, so extra actions never shift them.
+        val primaryWidth = with(density) { primaryActionsWidth.roundToPx() }
+        val anchor = selectionToolbarPosition(endpoint, viewport.canvas,
+            IntSize(primaryWidth, toolbarSize.height), gap, inset, topInset, bottomInset)
+        val availableWidth = with(density) { (viewport.canvas.width - anchor.x - inset).coerceAtLeast(primaryWidth.toFloat()).toDp() }
+        SelectionActionsBubble(
+            entities = entities,
+            onSearch = { search.submit(selected) },
+            onCopy = {
+                val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                clipboard?.setPrimaryClip(android.content.ClipData.newPlainText(clipLabel, selected))
+            },
+            onExternalAction = onDismiss,
+            modifier = Modifier.offset { anchor }.widthIn(max = availableWidth).onSizeChanged { toolbarSize = it },
+        )
+    }
+    MovableInstructionPanel(visible = !search.isOpen && selected.isEmpty()) {
+        Text(stringResource(when {
             resolvedOptions == null -> R.string.overlay_running_ocr
             ocrFailed && resolvedOptions.words.isEmpty() -> R.string.overlay_ocr_failed
             resolvedOptions.words.isEmpty() -> R.string.overlay_no_text
             else -> R.string.overlay_select_text
-        }
-        Row(Modifier.fillMaxWidth().padding(end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.weight(1f)) { SelectionActions(selected, entities, message, onDismiss) }
-            if (ocrFailed) {
-                TextButton(onClick = onRetryOcr) { Text(stringResource(R.string.overlay_ocr_retry)) }
-            }
-            if (onImageMode != null) {
-                TextButton(onClick = onImageMode) { Text(stringResource(R.string.overlay_image_mode)) }
-            }
-        }
+        }), Modifier.padding(12.dp))
+        if (ocrFailed) TextButton(onClick = onRetryOcr) { Text(stringResource(R.string.overlay_ocr_retry)) }
+        if (onImageMode != null) TextButton(onClick = onImageMode) { Text(stringResource(R.string.overlay_image_mode)) }
+        if (entities.isNotEmpty()) EntityActionChipsRow("", entities, onDismiss)
     }
 }
 
