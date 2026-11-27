@@ -104,7 +104,7 @@ def main():
                 rows.append({'run': run, **pair})
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open('w', newline='') as output:
-            writer = csv.DictWriter(output, fieldnames=FIELDS)
+            writer = csv.DictWriter(output, fieldnames=FIELDS, lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
         print(f'PASS: {len(rows)} pairs, exact text and geometry equality; metadata CSV: {args.output}')
