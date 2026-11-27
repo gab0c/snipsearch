@@ -10,6 +10,14 @@ Please do not open a public issue for a security problem.
 
 SnipSearch has not been released yet. Once releases exist, this section will state which versions receive security fixes.
 
+## OCR security model
+
+The intended architecture runs bundled PP-OCRv6 Tiny / ONNX Runtime inference in the main app process on background workers. OCR isolation is no longer a required security boundary. The current code still contains the legacy isolated service; replacing it is a pending implementation task, not a completed runtime change. See [`docs/plan.md`](docs/plan.md) §4.3.
+
+OCR shares the app's UID, permissions, and address space. A native OCR crash can terminate the app, and a native-code compromise can gain app-process privileges. We accept the loss of separate-process containment; we do not claim OCR has an independently enforced network or storage sandbox. This change does not alter Android's normal app sandbox or system WebView isolation.
+
+Screen pixels, intermediate tensors and extracted text must remain in RAM, with explicit lifecycle cleanup. OCR code must not make network requests or persist screen content. Extracted content leaves the device only after an explicit user action. These are application-level requirements; the GrapheneOS Network toggle can additionally revoke networking for the entire app. `FLAG_SECURE` handling, synchronous memory tagging on supported hardware, pinned/verified dependencies, hardware-backed credential storage requirements, and release signing protections remain in force. Feature requirements in the plan do not imply that every feature is already implemented.
+
 ## Release signing
 
 Release APKs are built unsigned and then signed in a separate CI job that runs in the protected GitHub `release` environment, as described in [`docs/plan.md`](docs/plan.md) §5.2. No signing material is stored in this repository, and Gradle has no release signing configuration (see `AGENTS.md` §3.4).

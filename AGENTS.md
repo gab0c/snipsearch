@@ -22,10 +22,11 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 3. **Single-APK + Scoped Network + GrapheneOS Network Toggle Degradation:**
    - The app is a single APK declaring `android.permission.INTERNET` to support the in-app Vanadium/System `WebView` bottom sheet and visual search uploads.
    - If the user revokes the **GrapheneOS Network toggle** (removing `AID_INET` / `GID 3003`), the app MUST NOT crash. It must detect offline state via `ConnectivityManager` / `SocketException`, disable the embedded `WebView` and remote image uploads, and degrade gracefully to offline text/QR extraction (`AssistStructure` + `PaddleOCR` + `ZXing`) and external browser `Intent.ACTION_VIEW` handoff.
-4. **Isolated Process On-Device OCR (`android:isolatedProcess="true"`):**
-   - Primary on-screen text extraction and word bounds come from **PP-OCRv6 Tiny** (`det` + `rec` `.onnx` models bundled uncompressed in `src/main/assets/ocr/`) via `onnxruntime-android` (`>= 1.22.0`) inside an `android:isolatedProcess="true"` bound `Service` (`OcrIsolatedService`).
+4. **In-Process On-Device OCR:**
+   - Primary on-screen text extraction and word bounds come from **PP-OCRv6 Tiny** (`det` + `rec` `.onnx` models bundled uncompressed in `src/main/assets/ocr/`) via `onnxruntime-android` (`>= 1.22.0`) in the main app process on background workers. OCR process isolation is not part of the security model; do not introduce a separate OCR service or process as a required security boundary.
    - `AssistStructure.ViewNode` data is kept for `FLAG_SECURE`/blocked-assist detection, local OCR misread correction hints (`OcrTextCorrection`), and fallback text selection when OCR returns no text or fails. Do **not** expose `AssistStructure` words as selectable before OCR completes (displaced view bounds and the mid-session swap degrade UX).
-   - Pass cropped `Bitmap` data and `.onnx` model descriptors across the Binder boundary using `SharedMemory` (`ashmem` / `ParcelFileDescriptor`) and `AssetFileDescriptor`.
+   - Keep pixel buffers and inference tensors in RAM with explicit ownership, cancellation, and cleanup. Load bundled models through local asset descriptors; no OCR Binder/AIDL or SharedMemory transport is required. OCR code must not perform network requests or persist screen content, but it shares the app UID, permissions, and address space: this is an application policy, not an OS-enforced sandbox.
+   - Transition note: the current `extraction.isolated` implementation is legacy code awaiting migration to `extraction.ocr`. Its presence does not reinstate an isolation requirement. Native OCR faults can terminate or compromise the app process; this accepted tradeoff does not relax any other security or privacy rule.
 
 ---
 
@@ -33,7 +34,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 
 1. **Zero Disk Persistence for Screen Captures:**
    - **NEVER** write full screenshots, cropped bitmaps, `AssistStructure` dumps, or extracted screen text to disk (`cacheDir`, `filesDir`, `externalCacheDir`, `File.createTempFile()`, `Context.openFileOutput()`, or SQLite/Room).
-   - Keep all screen capture buffers strictly in RAM (`Bitmap`, `ByteArrayOutputStream`, `SharedMemory`).
+   - Keep all screen capture buffers strictly in RAM (`Bitmap`, `ByteArrayOutputStream`, direct pixel/tensor buffers).
 2. **Immediate Uncropped Buffer Scrubbing:**
    - As soon as the user completes or adjusts a crop—or immediately when delegating a power-button press—release and zero out references to uncropped intermediate buffers.
    - Inside `VoiceInteractionSession.onHide()` and `onDestroy()`, explicitly recycle/nullify all `Bitmap` references and zero out any `ByteArray` image buffers (`bytes.fill(0)`).
@@ -104,7 +105,7 @@ All AI coding agents (**Cursor**, **Codex**, and **Hermes**) and human contribut
 
 1. **Before Writing Code:**
    - Read `docs/plan.md` to confirm module boundaries, package structure, and current milestone requirements.
-   - Keep changes scoped to a single milestone or package boundary (`assistant`, `extraction`, `extraction.isolated`, `search`, `security`, `storage`, `ui`) to enable conflict-free parallel execution across Cursor subagents, Codex tasks, and Hermes runs.
+   - Keep changes scoped to a single milestone or package boundary (`assistant`, `extraction`, `extraction.ocr`, `search`, `security`, `storage`, `ui`) to enable conflict-free parallel execution across Cursor subagents, Codex tasks, and Hermes runs.
 2. **Standard Verification Commands (Run Before Finishing Any Task):**
    - **Unit & Security Regression Tests:** `./gradlew testDebugUnitTest`
    - **Android Lint Security Gate:** `./gradlew lintRelease`
