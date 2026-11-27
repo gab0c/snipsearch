@@ -12,6 +12,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.IOException
@@ -46,6 +48,7 @@ internal class OcrCoordinator(
     }.asCoroutineDispatcher()
     private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val stateLock = Any()
+    private val scanAdmission = Mutex()
     private var engine: OcrEngine? = null
     private var closed = false
     private var idleGeneration = 0L
@@ -75,8 +78,10 @@ internal class OcrCoordinator(
         onReady: (OcrReadyInfo) -> Unit = {},
         onDetect: (Int, Long) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
-    ): List<OcrLine> {
-        return withContext(workerDispatcher) {
+    ): List<OcrLine> = scanAdmission.withLock {
+        // Waiters cancel before entering the worker queue, so superseded inputs can
+        // be scrubbed even while an earlier native call is still running.
+        withContext(workerDispatcher) {
             check(!isClosed()) { "OCR coordinator is destroyed" }
             val reused = engine != null
             val start = System.nanoTime()

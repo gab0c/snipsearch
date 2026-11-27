@@ -9,6 +9,8 @@ import android.graphics.Typeface
 import android.util.Log
 import com.snipsearch.extraction.OcrLine
 import com.snipsearch.extraction.isolated.OcrClientCoordinator
+import com.snipsearch.extraction.isolated.SessionOcrRunner as LegacyRunner
+import com.snipsearch.extraction.isolated.OcrScanSnapshot as LegacySnapshot
 import com.snipsearch.extraction.ocr.OcrCoordinator
 import com.snipsearch.extraction.ocr.OcrScanSnapshot
 import com.snipsearch.extraction.ocr.SessionOcrRunner
@@ -54,14 +56,14 @@ class OcrMigrationBenchmarkRunner(
                         order.forEach { mode ->
                             if (mode == "legacy") {
                                 val legacy = OcrClientCoordinator(context, idleUnbindDelayMs = 0L)
+                                val legacyRunner = LegacyRunner(legacy)
                                 try {
                                     val start = System.nanoTime()
-                                    val lines = runBlocking { legacy.recognize(bitmap) }
+                                    val lines = runLegacyScan(legacyRunner, bitmap)
                                     val ms = (System.nanoTime() - start) / 1_000_000.0
                                     results[mode] = toRunResult(ms, lines)
                                 } finally {
-                                    legacy.release()
-                                    legacy.destroy()
+                                    legacyRunner.onSessionDestroy()
                                     Thread.sleep(LEGACY_TEARDOWN_DELAY_MS)
                                 }
                             } else {
@@ -85,11 +87,12 @@ class OcrMigrationBenchmarkRunner(
 
                     onStatus("Fixture ${fixture.id}: warm x$WARM_REPETITIONS (+2 warmup)")
                     val legacyWarm = OcrClientCoordinator(context, idleUnbindDelayMs = 60_000L)
+                    val legacyWarmRunner = LegacyRunner(legacyWarm)
                     val localWarmCoordinator = OcrCoordinator(context)
                     val localWarmRunner = SessionOcrRunner(localWarmCoordinator)
                     try {
                         repeat(2) {
-                            runBlocking { legacyWarm.recognize(bitmap) }
+                            runLegacyScan(legacyWarmRunner, bitmap)
                             runLocalScan(localWarmRunner, bitmap)
                         }
                         repeat(WARM_REPETITIONS) { trial ->
@@ -98,7 +101,7 @@ class OcrMigrationBenchmarkRunner(
                             order.forEach { mode ->
                                 val start = System.nanoTime()
                                 val lines = if (mode == "legacy") {
-                                    runBlocking { legacyWarm.recognize(bitmap) }
+                                    runLegacyScan(legacyWarmRunner, bitmap)
                                 } else {
                                     runLocalScan(localWarmRunner, bitmap)
                                 }
@@ -109,8 +112,7 @@ class OcrMigrationBenchmarkRunner(
                             warmPairs++
                         }
                     } finally {
-                        legacyWarm.release()
-                        legacyWarm.destroy()
+                        legacyWarmRunner.onSessionDestroy()
                         Thread.sleep(LEGACY_TEARDOWN_DELAY_MS)
                         localWarmRunner.onSessionDestroy()
                         localWarmCoordinator.destroy()
@@ -175,6 +177,19 @@ class OcrMigrationBenchmarkRunner(
             Log.i(TAG, "lifecycle hardwareEqual=true cropEqual=true idleEvicted=true")
         } finally { runner.onSessionDestroy() }
         kotlinx.coroutines.delay(150)
+    }
+
+    private fun runLegacyScan(runner: LegacyRunner, bitmap: Bitmap): List<OcrLine> = runBlocking {
+        val scanId = runner.nextScanId()
+        runner.startScan(scanId, bitmap)
+        val snapshot = withTimeout(SCAN_TIMEOUT_MS) {
+            runner.state.first {
+                it.scanId == scanId &&
+                    (it.status == LegacySnapshot.Status.COMPLETE || it.status == LegacySnapshot.Status.FAILED)
+            }
+        }
+        check(snapshot.status == LegacySnapshot.Status.COMPLETE) { "LegacyOcrScanFailed" }
+        snapshot.lines
     }
 
     private fun runLocalScan(runner: SessionOcrRunner, bitmap: Bitmap): List<OcrLine> = runBlocking {

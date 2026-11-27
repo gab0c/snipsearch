@@ -59,9 +59,13 @@ def main():
                                  'app/src/main/kotlin/com/snipsearch/extraction/isolated',
                                  capture_output=True).stdout.splitlines()
         for source in baseline_paths:
-            if source.endswith('SessionOcrRunner.kt'):
-                continue
             data = subprocess.check_output(['git', 'show', f'{BASELINE}:{source}'], cwd=ROOT)
+            if source.endswith('SessionOcrRunner.kt'):
+                # Content-free logger was renamed by the migration; benchmark calls use timing=null.
+                text = data.decode()
+                text = re.sub(r'timing\?\.logServiceReady\((ready|info)\.bindMs, \1\.initMs, \1\.reused\)',
+                              r'timing?.logEngineReady(\1.initMs, \1.reused)', text)
+                data = text.encode()
             add(source.replace('src/main/', 'src/debug/'), data)
         for name in ['OcrMigrationBenchmarkRunner.kt', 'OcrMigrationBenchmarkInstrumentation.kt']:
             add(f'app/src/debug/kotlin/com/snipsearch/debug/{name}', (TEMPLATES / name).read_bytes())

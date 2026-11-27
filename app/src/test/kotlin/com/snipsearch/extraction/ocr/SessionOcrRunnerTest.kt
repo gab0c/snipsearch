@@ -172,6 +172,43 @@ class SessionOcrRunnerTest {
         }
     }
 
+    @Test
+    fun supersededQueuedScanScrubsBeforeEarlierNativeInferenceReturns() = runBlocking {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val coordinator = OcrCoordinator(context, engineFactory = {
+            object : OcrEngine {
+                override fun recognize(argb: IntBuffer, width: Int, height: Int, stride: Int,
+                    isCancelled: () -> Boolean, onDetected: (Int, Long) -> Unit): List<OcrLine> {
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS))
+                    return emptyList()
+                }
+                override fun close() = Unit
+            }
+        })
+        val copies = ArrayList<OcrCoordinator.CropPixels>()
+        val runner = SessionOcrRunner(coordinator, pixelCopier = { bitmap, cancelled ->
+            OcrCoordinator.CropPixels.copy(bitmap, cancelled)!!.also(copies::add)
+        })
+        val source = bitmap(0xff010203.toInt())
+        try {
+            runner.startScan(runner.nextScanId(), source)
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            runner.startScan(runner.nextScanId(), source)
+            delay(100) // Let this scan queue behind the native reader.
+            runner.startScan(runner.nextScanId(), source)
+            kotlinx.coroutines.withTimeout(1_000) {
+                while (copies[1].buffer.get(0) != 0) delay(5)
+            }
+            assertEquals(0xff010203.toInt(), copies[0].buffer.get(0))
+        } finally {
+            release.countDown()
+            runner.onSessionDestroy()
+            source.recycle()
+        }
+    }
+
     private fun bitmap(color: Int) = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888).apply { eraseColor(color) }
 
     private suspend fun eventually(condition: () -> Boolean) {
