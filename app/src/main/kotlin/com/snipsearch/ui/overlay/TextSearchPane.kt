@@ -53,7 +53,6 @@ internal class TextSearchSession(
             // Required for Google results/CAPTCHA. Main-frame navigation is restricted to approved
             // Google HTTPS hosts; clicked external links use the browser. No native JS bridge,
             // content/file access, mixed content, or certificate-error bypass is exposed.
-            // codeql[java/android/websettings-javascript-enabled]
             settings.javaScriptEnabled = true
             web.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
