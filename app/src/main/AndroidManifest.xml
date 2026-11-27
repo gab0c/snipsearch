@@ -76,12 +76,6 @@
                 android:value="android.service.quicksettings.CATEGORY_UTILITIES" />
         </service>
 
-        <service
-            android:name=".extraction.isolated.OcrIsolatedService"
-            android:exported="false"
-            android:isolatedProcess="true"
-            android:useAppZygote="false" />
-
         <activity
             android:name=".assistant.TileCaptureActivity"
             android:exported="false"

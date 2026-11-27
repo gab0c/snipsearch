@@ -28,8 +28,8 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.snipsearch.R
 import com.snipsearch.extraction.OcrTiming
-import com.snipsearch.extraction.isolated.OcrClientCoordinator
-import com.snipsearch.extraction.isolated.SessionOcrRunner
+import com.snipsearch.extraction.ocr.OcrCoordinator
+import com.snipsearch.extraction.ocr.SessionOcrRunner
 import com.snipsearch.security.SessionMemory
 import com.snipsearch.ui.overlay.OverlayScreen
 import com.snipsearch.ui.theme.SnipTheme
@@ -53,7 +53,7 @@ class SnipVoiceInteractionSession(
     override val savedStateRegistry get() = stateRegistry.savedStateRegistry
     private val mainHandler = Handler(Looper.getMainLooper())
     private val memory = SessionMemory()
-    private val ocrCoordinator = OcrClientCoordinator(context.applicationContext ?: context)
+    private val ocrCoordinator = OcrCoordinator(context.applicationContext ?: context)
     private val ocrRunner = SessionOcrRunner(ocrCoordinator)
     private val controller = SessionController(
         memory = memory,

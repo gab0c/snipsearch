@@ -70,9 +70,9 @@ import com.snipsearch.extraction.OcrTextCorrection
 import com.snipsearch.extraction.OcrTiming
 import com.snipsearch.extraction.OcrWord
 import com.snipsearch.extraction.PixelRegion
-import com.snipsearch.extraction.isolated.OcrClientCoordinator
-import com.snipsearch.extraction.isolated.OcrScanSnapshot
-import com.snipsearch.extraction.isolated.SessionOcrRunner
+import com.snipsearch.extraction.ocr.OcrCoordinator
+import com.snipsearch.extraction.ocr.OcrScanSnapshot
+import com.snipsearch.extraction.ocr.SessionOcrRunner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -104,7 +104,7 @@ internal fun OverlayScreen(
 ) {
     val context = LocalContext.current.applicationContext
     val ownedRunner = remember(context, ocrRunner) {
-        if (ocrRunner == null) SessionOcrRunner(OcrClientCoordinator(context)) else null
+        if (ocrRunner == null) SessionOcrRunner(OcrCoordinator(context)) else null
     }
     DisposableEffect(ownedRunner) {
         onDispose { ownedRunner?.onSessionDestroy() }

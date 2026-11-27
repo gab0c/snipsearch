@@ -1,4 +1,4 @@
-package com.snipsearch.extraction.isolated
+package com.snipsearch.extraction.ocr
 
 import kotlin.math.abs
 import kotlin.math.ceil

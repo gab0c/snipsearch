@@ -1,4 +1,4 @@
-package com.snipsearch.extraction.isolated
+package com.snipsearch.extraction.ocr
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder

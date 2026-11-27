@@ -8,7 +8,7 @@
 - **Native Assistant Trigger Without Accessibility Abuse:** Uses Android's `VoiceInteractionService` (`ROLE_ASSISTANT`) to receive an on-demand screenshot (`onHandleScreenshot`) and view hierarchy (`onHandleAssist`) strictly at the moment the user invokes it—requiring **zero** `AccessibilityService`, **zero** `SYSTEM_ALERT_WINDOW`, and **zero** persistent background observation.
 - **Coexistence with Secondary Voice Assistants:** Uses AOSP `invocation_type` trigger-source routing so swiping up from a bottom corner (or long-pressing Home in 3-button navigation) opens SnipSearch while long-pressing the power button (the stock Android assistant trigger; GrapheneOS keeps the power menu there) can delegate directly to Gemini, Google Assistant, Dicio, Home Assistant, or do nothing.
 - **Unified In-App Bottom-Sheet UX:** Mounts a Jetpack Compose `BottomSheetScaffold` hosting the system `WebView` (Vanadium WebView on GrapheneOS) directly inside the `VoiceInteractionSession` window so users can resize the crop box, add follow-up text (*"Add to your search"*), and browse results seamlessly.
-- **100% Offline Text, Entity & QR Extraction:** Uses **PP-OCRv6 Tiny** via **ONNX Runtime** in an air-gapped `android:isolatedProcess="true"` sandbox for on-screen text and its positions. `AssistStructure` supplies correction hints and fallback text. Pure JVM `ZXing` decodes QR codes and barcodes.
+- **100% Offline Text, Entity & QR Extraction:** Uses **PP-OCRv6 Tiny** via **ONNX Runtime** on background workers in the main app process for on-screen text and its positions. `AssistStructure` supplies correction hints and fallback text. Pure JVM `ZXing` decodes QR codes and barcodes.
 - **GrapheneOS Hardened & Reproducible:** Supports synchronous hardware Memory Tagging (`memtagMode="sync"`), 16KB page sizes, graceful offline degradation when the GrapheneOS Network toggle is disabled, `AndroidKeyStore` StrongBox/TEE encryption for custom API keys, and reproducible multi-ABI GitHub Releases with SLSA Level 3 provenance and `apksigcopier` verification.
 
 ---
@@ -17,9 +17,9 @@
 
 | Area | Locked Decision | Rationale |
 | :--- | :--- | :--- |
-| **Target Platform** | Android 16–17 (API 36–37): `minSdk` 36, `targetSdk` 37, `compileSdk` 37. 100% Kotlin + Jetpack Compose | Covers current GrapheneOS (Android 17) and the previous release; modern `VoiceInteractionSession`, `SharedMemory`, and 16KB page-alignment support; zero legacy bloat. See §2.1 for what targeting API 37 changes. |
+| **Target Platform** | Android 16–17 (API 36–37): `minSdk` 36, `targetSdk` 37, `compileSdk` 37. 100% Kotlin + Jetpack Compose | Covers current GrapheneOS (Android 17) and the previous release; modern `VoiceInteractionSession`, in-memory OCR, and 16KB page-alignment support; zero legacy bloat. See §2.1 for what targeting API 37 changes. |
 | **Assistant Role & Trigger** | `VoiceInteractionService` (`ROLE_ASSISTANT`) + AOSP `invocation_type` routing + Quick Settings `TileService` (`showSession()`) | Zero `AccessibilityService` or `MediaProjection` permissions; coexists with power-button voice assistants. |
-| **Process & Network Model** | Single APK with `INTERNET` + `android:isolatedProcess="true"` OCR service + GrapheneOS Network toggle degradation | Enables native single-window bottom-sheet `WebView` UX while sandboxing native C++ OCR inference and supporting air-gapped OS network revocation. |
+| **Process & Network Model** | Single APK with `INTERNET` + in-process OCR on background workers + GrapheneOS Network toggle degradation | Enables native single-window bottom-sheet `WebView` UX and offline OCR. OCR shares the app UID and address space; the OS Network toggle applies to the app as a whole. No OCR isolation guarantee is made. |
 | **Text & Entity Extraction** | Primary: Bundled **PP-OCRv6 Tiny** (`onnxruntime-android >= 1.22.0`) in `/assets/ocr/`<br>Hints and fallback: `AssistStructure` ViewNode tree<br>Offline `com.google.zxing:core` QR/barcode and regex URL/email/phone chips | Screenshot-based word positions, zero disk I/O, zero Play Services, and 16KB page alignment. |
 | **Visual Upload Pipeline** | **Hybrid Pipeline:**<br>1. In-WebView Chromium `<form>` POST (via `shouldInterceptRequest` RAM stream) for browser engines<br>2. `HttpsURLConnection` for REST/JSON Vision APIs | Preserves authentic Vanadium/Chromium TLS (JA3/JA4) & HTTP/2/3 fingerprint to prevent VPN CAPTCHAs and allows inline CAPTCHA solving. |
 | **Cookie & Anti-CAPTCHA Policy** | **Smart Cookie Retention (Default)** + Pre-seeded `SOCS` consent cookie + 1-tap "Clear Session" broom button + "Strict Ephemeral" toggle | Prevents endless CAPTCHA loops on Mullvad/Proton VPNs and bypasses EU GDPR consent walls that drop image POST payloads. |
@@ -39,6 +39,8 @@
 
 ## 3. System Architecture & Module Layout
 
+The layout and OCR specification below describe the in-process architecture implemented under `extraction.ocr`. OCR isolation is not a security boundary.
+
 ```
 snipsearch/
 ├── AGENTS.md
@@ -53,9 +55,6 @@ snipsearch/
 │   └── src/
 │       ├── main/
 │       │   ├── AndroidManifest.xml
-│       │   ├── aidl/com/snipsearch/ipc/
-│       │   │   ├── IOcrIsolatedService.aidl
-│       │   │   └── OcrTextBlockParcelable.aidl
 │       │   ├── assets/ocr/
 │       │   │   ├── PP-OCRv6_tiny_det_infer.onnx
 │       │   │   ├── PP-OCRv6_tiny_rec_infer.onnx
@@ -72,9 +71,9 @@ snipsearch/
 │       │   │   ├── extraction/
 │       │   │   │   ├── AssistStructureParser.kt
 │       │   │   │   ├── EntityAndQrDetector.kt
-│       │   │   │   ├── OcrClientCoordinator.kt
-│       │   │   │   └── isolated/
-│       │   │   │       ├── OcrIsolatedService.kt
+│       │   │   │   └── ocr/
+│       │   │   │       ├── OcrCoordinator.kt
+│       │   │   │       ├── SessionOcrRunner.kt
 │       │   │   │       ├── PaddleOcrEngine.kt
 │       │   │   │       └── CtcBeamDecoder.kt
 │       │   │   ├── search/
@@ -183,14 +182,9 @@ snipsearch/
                 android:resource="@xml/recognition_service" />
         </service>
 
-        <!-- 4. Isolated Process On-Device OCR Sandbox (Zero Network / Zero Storage) -->
-        <service
-            android:name=".extraction.isolated.OcrIsolatedService"
-            android:isolatedProcess="true"
-            android:useAppZygote="false"
-            android:exported="false" />
+        <!-- OCR runs in-process on background workers; no OCR service is declared. -->
 
-        <!-- 5. Quick Settings Tile (triggers showSession() when ROLE_ASSISTANT is active) -->
+        <!-- 4. Quick Settings Tile (triggers showSession() when ROLE_ASSISTANT is active) -->
         <service
             android:name=".assistant.SnipQuickSettingsTileService"
             android:label="@string/tile_label"
@@ -273,34 +267,14 @@ When `invocationType == 6` (`POWER_BUTTON_LONG_PRESS`):
 - **QR & Barcode Decoding:** Passes the cropped `Bitmap`'s `IntArray` luminance pixels to `com.google.zxing.MultiFormatReader` (configured for `QR_CODE`, `DATA_MATRIX`, `AZTEC`, `EAN_13`, `CODE_128`) on `Dispatchers.Default`. Zero native C++ code.
 - **Entity Regex / `TextClassifier`:** Scans the selected OCR or fallback text for URLs (`https?://...`), email addresses, phone numbers, and coupon/tracking codes and offers matching action chips.
 
-#### `OcrIsolatedService` (Primary text selection using PP-OCRv6 Tiny)
+#### In-process OCR (Primary text selection using PP-OCRv6 Tiny)
 - Once OCR is available, run it first for on-screen text selection, including when `AssistStructure` also returns text. Return recognized words and their bounds in screenshot coordinates. Use those bounds for highlights, hit tests, and selection handles.
 - Use `AssistStructure` strings as local hints to correct likely OCR misreads when there is a unique, strong match in the same screen area. Keep the OCR bounds and preserve the visibly recognized span. Skip corrections for ambiguous matches, conflicting positions, or text extending past what is visible, such as a truncated filename. Avoid duplicate highlights.
-- **IPC Contract (`IOcrIsolatedService.aidl`):**
-  ```aidl
-  package com.snipsearch.ipc;
-
-  import android.os.SharedMemory;
-  import android.content.res.AssetFileDescriptor;
-  import com.snipsearch.ipc.OcrTextBlockParcelable;
-
-  interface IOcrIsolatedService {
-      void initializeModels(
-          in AssetFileDescriptor detModelFd,
-          in AssetFileDescriptor recModelFd,
-          in AssetFileDescriptor keysDictFd
-      );
-      List<OcrTextBlockParcelable> recognizeCrop(
-          in SharedMemory argbPixelsAshmem,
-          int width,
-          int height,
-          int stride
-      );
-  }
-  ```
-- **Why `SharedMemory` + `AssetFileDescriptor`?**
-  - An `android:isolatedProcess="true"` service runs under an ephemeral isolated UID with **zero network access**, **zero filesystem access**, and **zero permissions**.
-  - Passing uncompressed `.onnx` model `AssetFileDescriptor`s (`noCompress += "onnx"`) and a read-only `SharedMemory` buffer containing the cropped ARGB pixels allows the isolated process to run `OrtEnvironment` and `OrtSession` purely in RAM with **zero temp files** and **zero disk I/O**.
+- **Execution and ownership:** Run detector/recognizer inference on bounded background workers inside the main app process. A coordinator owns model sessions and initialization; the session runner owns scan generations and cancellation. Use ordinary Kotlin result types rather than AIDL parcelables. Keep existing model settings, confidence filtering, correction hints, and screenshot-coordinate bounds.
+- **RAM-only input:** Convert the screenshot or crop to an explicitly owned pixel buffer before asynchronous work can outlive the source bitmap. Avoid redundant copies while preventing bitmap recycling races. Scrub pixel arrays and direct/tensor buffers on completion, cancellation, hide, and destroy as applicable. Retained model sessions must not retain prior screen pixels or text.
+- **Model access:** Keep `.onnx` assets uncompressed (`noCompress += "onnx"`) and read them through local asset descriptors. Model assets may be read from the APK; screen content must never be written to disk. OCR runs in-process, without service binding, Binder/AIDL transport, or SharedMemory plumbing.
+- **Trust boundary:** OCR shares the app's memory, UID and permissions. It must not make network requests or persist screen content, but no OS-enforced OCR network/storage sandbox or native-crash containment is promised. A native OCR failure may terminate the app; a native compromise may gain app privileges. Memory tagging, dependency verification, explicit user action before search, and all other privacy controls remain required.
+- **Lifecycle and recovery:** Initialize outside the main thread, serialize model ownership against active recognition, bound concurrency, reject stale results, and close resources safely on idle eviction/destroy. Reuse only screen-independent model state. Handle recoverable initialization/inference errors with existing AssistStructure fallback; do not claim coroutine cancellation can interrupt an arbitrary stuck native call. The coordinator uses one dedicated serial worker for initialization/inference/close, retaining models for 60 seconds after hide; the existing 2–4 recognizer workers and recognizer initialization thread remain unchanged. `startScan` synchronously copies into one owned direct pixel buffer before scheduling inference, so no inference job retains the source bitmap. Cancellation rejects stale progress/results immediately; input buffers are scrubbed after native readers finish. Hide/destroy never wait for inference or model close. Copying is a bounded RAM transfer on the caller thread and may briefly delay that callback; cooperative cancellation cannot forcibly interrupt native inference or initialization.
 
 ---
 
@@ -426,7 +400,7 @@ android {
         versionName = "0.1.0"
     }
 
-    // Keep ONNX models uncompressed for zero-copy AssetFileDescriptor IPC to isolatedProcess
+    // Keep ONNX models uncompressed for direct local asset-descriptor access
     androidResources {
         noCompress += listOf("onnx", "txt")
     }
@@ -529,12 +503,12 @@ All GitHub Actions MUST be pinned to full 40-character commit SHAs with top-leve
 - **Next overlay goal:** Prototype text versus image gesture detection in §4.2. Verify geometry-dependent behavior with milestone 4.
 - **Verification:** Unit tests for `AssistStructureParser` coordinate math and `EntityAndQrDetector` QR/URL extraction.
 
-### Milestone 4: Sandboxed PP-OCRv6 Tiny (`android:isolatedProcess="true"`)
-- Define `IOcrIsolatedService.aidl` and `OcrTextBlockParcelable.aidl`.
+### Milestone 4: In-Process PP-OCRv6 Tiny
+- Run OCR through a background in-process coordinator and ordinary Kotlin result types under `extraction.ocr`. The OCR service declaration and OCR-only AIDL/IPC plumbing have been removed.
 - Bundle quantized PP-OCRv6 Tiny `.onnx` models in `src/main/assets/ocr/`. The recognizer exports only `[1,T]` ArgMax IDs and maximum probabilities; keep Softmax internal and reject uncertain words/glyphs before publishing the complete OCR result. See the pinned upstream hashes and regeneration commands in `assets/ocr/NOTICE.txt`.
-- Implement `OcrIsolatedService`, `PaddleOcrEngine` (Kotlin `Bitmap -> FloatBuffer` preprocessing + `OrtSession` inference + `CtcBeamDecoder`), and `OcrClientCoordinator` (`SharedMemory` + `AssetFileDescriptor` IPC).
+- Keep `PaddleOcrEngine` (Kotlin pixel preprocessing + `OrtSession` inference + `CtcBeamDecoder`) and move model/session ownership into `OcrCoordinator`. Preserve existing inference settings and cancellation/generation behavior in `SessionOcrRunner`; use locally owned RAM buffers.
 - Use screenshot-coordinate OCR word bounds for text selection and test hierarchy-assisted corrections against displaced bounds, repeated labels, and truncated filenames. Retest highlight alignment and text drags on a real phone in Android Files and a browser, including after scrolling.
-- **Verification:** Instrumentation/Robolectric tests verifying zero temp files created during OCR and clean recovery if the isolated service is killed.
+- **Verification:** Deterministic tests for no screen-content disk writes, pixel/tensor scrubbing, cancellation/hide/destroy races, stale-result rejection, idle model reuse/eviction, initialization/inference failure fallback, and output/word-bound equivalence. Exercise the real inference path on an emulator; do not assert OCR isolation or process-crash containment.
 
 ### Milestone 5: Search UI & WebView (incremental)
 - Current scope: text selection exposes floating Search and Copy actions. A single Search tap snapshots the selected text and opens Google results; later selections do not alter that query. Results open at 60% of safe session height with only a small drag tab. An upward swipe in the reduced pane or a webpage tap expands to full height; downward drag collapses from full height and dismisses the entire assistant session from peek height. The same WebView and query remain alive across height changes; session teardown destroys and clears the WebView. Image search uploads remain deferred.
