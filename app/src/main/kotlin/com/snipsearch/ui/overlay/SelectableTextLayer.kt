@@ -13,12 +13,16 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import com.snipsearch.extraction.AssistTextBlock
@@ -124,69 +128,193 @@ internal fun SelectableTextLayer(
     onSelect: (IntRange?) -> Unit,
     modifier: Modifier = Modifier,
     onActiveHandle: (SelectionHandle) -> Unit = {},
+    onSuggestCrop: ((PixelRegion) -> Unit)? = null,
 ) {
     val rects = words.map { viewport.toCanvas(it.bounds.mapBetween(screen, viewport.imageBounds)) }
-    val trail = rememberSelectionGlowTrail(words, viewport, screen)
+    val trail = rememberSelectionGlowTrail(viewport, screen)
+    val wordsState by rememberUpdatedState(words)
+    val rectsState by rememberUpdatedState(rects)
     val current by rememberUpdatedState(selection)
     val update by rememberUpdatedState(onSelect)
     val updateHandle by rememberUpdatedState(onActiveHandle)
+    val suggestCrop by rememberUpdatedState(onSuggestCrop)
+    var livePreview by remember(viewport, screen) { mutableStateOf<GesturePreview>(GesturePreview.None) }
     val highlight = SnipColors.SnipBlueGlow
-    fun anchor(index: Int, start: Boolean) = selectionHandleAnchor(words, rects, index, start)
 
-    Canvas(modifier.pointerInput(words, viewport, screen) {
+    Canvas(modifier.pointerInput(viewport, screen) {
         awaitEachGesture {
             val down = awaitFirstDown()
             val p = down.position
+            val downWords = wordsState
+            val downRects = rectsState
             val previous = current
-            val handleRadius = 24.dp.toPx()
-            val startDistance = previous?.let { (p - anchor(it.first, true)).getDistance() } ?: Float.MAX_VALUE
-            val endDistance = previous?.let { (p - anchor(it.last, false)).getDistance() } ?: Float.MAX_VALUE
-            val movingHandle = minOf(startDistance, endDistance) <= handleRadius
-            updateHandle(if (movingHandle && startDistance <= endDistance) SelectionHandle.START else SelectionHandle.END)
-            var fixed = if (movingHandle && previous != null) {
-                if (startDistance <= endDistance) previous.last else previous.first
+            val handle = hitTextSelectionHandle(
+                downWords, downRects, previous, p, TEXT_HANDLE_RADIUS_DP.dp.toPx(),
+            )
+            if (handle != null && previous != null) {
+                updateHandle(handle)
+                val fixed = if (handle == SelectionHandle.START) previous.last else previous.first
+                down.consume()
+                try {
+                    do {
+                        val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                        if (change.isConsumed) break
+                        if (change.position != change.previousPosition) {
+                            val liveWords = wordsState
+                            val liveRects = rectsState
+                            if (fixed in liveWords.indices && fixed in liveRects.indices) {
+                                val end = nearestWord(liveRects, change.position)
+                                if (end in liveWords.indices) {
+                                    updateHandle(if (end < fixed) SelectionHandle.START else SelectionHandle.END)
+                                    update(minOf(fixed, end)..maxOf(fixed, end))
+                                }
+                            }
+                        }
+                        change.consume()
+                    } while (change.pressed)
+                } finally {
+                    trail.clear()
+                }
+            } else if (suggestCrop == null) {
+                updateHandle(SelectionHandle.END)
+                var fixed = nearestWord(downRects, p, TAP_WORD_TOLERANCE_DP.dp.toPx())
+                down.consume()
+                trail.start(p, down.uptimeMillis)
+                try {
+                    update(if (fixed >= 0) fixed..fixed else null)
+                    do {
+                        val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                        if (change.isConsumed) break
+                        if (change.position != change.previousPosition) {
+                            val liveRects = rectsState
+                            if (change.pressed) trail.extend(change.position, change.uptimeMillis, density)
+                            if (fixed < 0) {
+                                fixed = firstCrossedWord(liveRects, change.previousPosition, change.position)
+                            }
+                            if (fixed >= 0 && fixed in liveRects.indices) {
+                                val end = nearestWord(liveRects, change.position)
+                                if (end >= 0) {
+                                    updateHandle(if (end < fixed) SelectionHandle.START else SelectionHandle.END)
+                                    update(minOf(fixed, end)..maxOf(fixed, end))
+                                }
+                            }
+                        }
+                        change.consume()
+                    } while (change.pressed)
+                } finally {
+                    trail.clear()
+                }
             } else {
-                nearestWord(rects, p, 8.dp.toPx())
-            }
-            down.consume()
-            if (!movingHandle) trail.start(p, down.uptimeMillis)
-            try {
-                if (!movingHandle) update(if (fixed >= 0) fixed..fixed else null)
-                do {
-                    val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                    if (change.isConsumed) break
-                    if (change.position != change.previousPosition) {
-                        if (!movingHandle && change.pressed) {
-                            trail.extend(change.position, change.uptimeMillis, density)
+                if (!viewport.frame.contains(p) &&
+                    nearestWord(downRects, p, TAP_WORD_TOLERANCE_DP.dp.toPx()) < 0
+                ) {
+                    return@awaitEachGesture
+                }
+                down.consume()
+                val rawPoints = ArrayList<Offset>(64).apply { add(p) }
+                trail.start(p, down.uptimeMillis)
+                livePreview = GesturePreview.Neutral
+                var released = false
+                try {
+                    while (true) {
+                        val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                        if (change.isConsumed) break
+                        if (change.position != change.previousPosition) {
+                            rawPoints += change.position
+                            if (change.pressed) {
+                                trail.extend(change.position, change.uptimeMillis, density)
+                                livePreview = previewGestureIntent(
+                                    rawPoints, rectsState, density, allowImageCrop = suggestCrop != null,
+                                )
+                            }
                         }
-                        if (fixed < 0) {
-                            fixed = firstCrossedWord(rects, change.previousPosition, change.position)
-                        }
-                        if (fixed >= 0) {
-                            val end = nearestWord(rects, change.position)
-                            updateHandle(if (end < fixed) SelectionHandle.START else SelectionHandle.END)
-                            update(minOf(fixed, end)..maxOf(fixed, end))
+                        change.consume()
+                        if (!change.pressed) {
+                            released = change.previousPressed
+                            break
                         }
                     }
-                    change.consume()
-                } while (change.pressed)
-            } finally {
-                trail.clear()
+                    when (
+                        val intent = resolveReleasedGesture(
+                            released, rawPoints, rectsState, density, allowImageCrop = suggestCrop != null,
+                        )
+                    ) {
+                        is GestureIntent.TextSelection -> {
+                            val liveWords = wordsState
+                            if (intent.range.first in liveWords.indices && intent.range.last in liveWords.indices) {
+                                updateHandle(intent.activeHandle)
+                                update(intent.range)
+                            }
+                        }
+                        is GestureIntent.ImageCrop -> {
+                            val clamped = intent.bounds.clampedTo(viewport.frame)
+                            val region = viewport.selection(
+                                clamped,
+                                CROP_LASSO_PADDING_DP.dp.toPx(),
+                                CROP_LASSO_MIN_DP.dp.toPx(),
+                            )
+                            suggestCrop?.invoke(region)
+                        }
+                        GestureIntent.ClearSelection -> update(null)
+                        GestureIntent.Ambiguous, null -> Unit
+                    }
+                } finally {
+                    trail.clear()
+                    livePreview = GesturePreview.None
+                }
             }
         }
     }) {
-        if (selection != null && selection.first in rects.indices && selection.last in rects.indices) {
-            val corner = CornerRadius(3.dp.toPx())
-            for (rect in selectionHighlightRects(words, rects, selection)) {
-                drawRoundRect(highlight.copy(alpha = 0.48f), rect.topLeft, rect.size, corner)
+        val corner = CornerRadius(3.dp.toPx())
+        when (val preview = livePreview) {
+            GesturePreview.None -> {
+                if (selection != null && selection.first in rects.indices && selection.last in rects.indices) {
+                    for (rect in selectionHighlightRects(words, rects, selection)) {
+                        drawRoundRect(highlight.copy(alpha = 0.48f), rect.topLeft, rect.size, corner)
+                    }
+                    for (endpoint in listOf(
+                        selectionHandleAnchor(words, rects, selection.first, true),
+                        selectionHandleAnchor(words, rects, selection.last, false),
+                    )) {
+                        drawCircle(Color.White, 7.dp.toPx(), endpoint)
+                        drawCircle(highlight, 5.dp.toPx(), endpoint)
+                    }
+                }
             }
-            for (handle in listOf(anchor(selection.first, true), anchor(selection.last, false))) {
-                drawCircle(Color.White, 7.dp.toPx(), handle)
-                drawCircle(highlight, 5.dp.toPx(), handle)
+            GesturePreview.Neutral -> Unit
+            is GesturePreview.TextSelection -> {
+                if (preview.range.first in rects.indices && preview.range.last in rects.indices) {
+                    for (rect in selectionHighlightRects(words, rects, preview.range)) {
+                        drawRoundRect(highlight.copy(alpha = 0.30f), rect.topLeft, rect.size, corner)
+                    }
+                }
+            }
+            is GesturePreview.ImageCrop -> {
+                val outline = preview.bounds.clampedTo(viewport.frame)
+                drawRect(
+                    Color.Black.copy(alpha = 0.28f),
+                    outline.topLeft,
+                    outline.size,
+                    style = Stroke(4.dp.toPx()),
+                )
+                drawRect(
+                    Color.White.copy(alpha = 0.65f),
+                    outline.topLeft,
+                    outline.size,
+                    style = Stroke(2.dp.toPx()),
+                )
             }
         }
         trail.draw(this)
     }
+}
+
+private fun Rect.clampedTo(frame: Rect): Rect {
+    val leftEdge = left.coerceIn(frame.left, frame.right)
+    val topEdge = top.coerceIn(frame.top, frame.bottom)
+    val rightEdge = right.coerceIn(frame.left, frame.right)
+    val bottomEdge = bottom.coerceIn(frame.top, frame.bottom)
+    return Rect(minOf(leftEdge, rightEdge), minOf(topEdge, bottomEdge), maxOf(leftEdge, rightEdge), maxOf(topEdge, bottomEdge))
 }
 
 internal fun selectionHighlightRects(
