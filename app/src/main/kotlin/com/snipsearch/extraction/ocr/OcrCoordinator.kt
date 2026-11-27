@@ -234,4 +234,3 @@ internal fun <T> withMutableArgbCopy(bitmap: Bitmap, action: (Bitmap) -> T): T {
         }
     }
 }
-

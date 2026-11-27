@@ -35,6 +35,19 @@ internal data class SelectableWord(
     val rtl: Boolean,
 )
 
+internal fun selectionHandleAnchor(words: List<SelectableWord>, rects: List<Rect>, index: Int, start: Boolean): Offset {
+    val rect = rects[index]
+    return Offset(if (start != words[index].rtl) rect.left else rect.right, rect.bottom)
+}
+
+internal enum class SelectionHandle { START, END }
+
+internal fun activeSelectionHandle(words: List<SelectableWord>, rects: List<Rect>, selection: IntRange?, handle: SelectionHandle): Offset? {
+    if (selection == null || selection.isEmpty() || selection.first !in words.indices || selection.last !in words.indices) return null
+    val start = handle == SelectionHandle.START
+    return selectionHandleAnchor(words, rects, if (start) selection.first else selection.last, start)
+}
+
 private val wordPattern = Regex("\\S+")
 
 /** Positions are estimates from Android's view bounds, line baselines and text size. */
@@ -110,16 +123,15 @@ internal fun SelectableTextLayer(
     selection: IntRange?,
     onSelect: (IntRange?) -> Unit,
     modifier: Modifier = Modifier,
+    onActiveHandle: (SelectionHandle) -> Unit = {},
 ) {
     val rects = words.map { viewport.toCanvas(it.bounds.mapBetween(screen, viewport.imageBounds)) }
     val trail = rememberSelectionGlowTrail(words, viewport, screen)
     val current by rememberUpdatedState(selection)
     val update by rememberUpdatedState(onSelect)
+    val updateHandle by rememberUpdatedState(onActiveHandle)
     val highlight = SnipColors.SnipBlueGlow
-    fun anchor(index: Int, start: Boolean): Offset {
-        val rect = rects[index]
-        return Offset(if (start != words[index].rtl) rect.left else rect.right, rect.bottom)
-    }
+    fun anchor(index: Int, start: Boolean) = selectionHandleAnchor(words, rects, index, start)
 
     Canvas(modifier.pointerInput(words, viewport, screen) {
         awaitEachGesture {
@@ -130,6 +142,7 @@ internal fun SelectableTextLayer(
             val startDistance = previous?.let { (p - anchor(it.first, true)).getDistance() } ?: Float.MAX_VALUE
             val endDistance = previous?.let { (p - anchor(it.last, false)).getDistance() } ?: Float.MAX_VALUE
             val movingHandle = minOf(startDistance, endDistance) <= handleRadius
+            updateHandle(if (movingHandle && startDistance <= endDistance) SelectionHandle.START else SelectionHandle.END)
             var fixed = if (movingHandle && previous != null) {
                 if (startDistance <= endDistance) previous.last else previous.first
             } else {
@@ -151,6 +164,7 @@ internal fun SelectableTextLayer(
                         }
                         if (fixed >= 0) {
                             val end = nearestWord(rects, change.position)
+                            updateHandle(if (end < fixed) SelectionHandle.START else SelectionHandle.END)
                             update(minOf(fixed, end)..maxOf(fixed, end))
                         }
                     }

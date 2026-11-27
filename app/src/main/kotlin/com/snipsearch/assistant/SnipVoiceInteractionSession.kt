@@ -8,11 +8,15 @@ import android.graphics.Bitmap
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.service.voice.VisibleActivityInfo
 import android.service.voice.VoiceInteractionSession
 import android.util.Log
 import android.view.Display
 import android.view.View
 import android.widget.TextView
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
@@ -59,6 +63,9 @@ class SnipVoiceInteractionSession(
     private val timeoutRunnable = Runnable { apply(controller.onCaptureTimeout(), showGeneration) }
     private val hideRunnable = Runnable { hide() }
 
+    private val activityWatch = VisibleActivityWatch<ActivityId>()
+    private var visibleActivityCallback: VisibleActivityCallback? = null
+
     private var composeView: ComposeView? = null
     private val overlayScreenshot = mutableStateOf<Bitmap?>(null)
     private val assistByIndex = sortedMapOf<Int, AssistStructure>()
@@ -79,6 +86,7 @@ class SnipVoiceInteractionSession(
 
     override fun onCreateContentView(): View {
         val root = layoutInflater.inflate(R.layout.session_overlay, null)
+        (root as SessionRootLayout).onUserInteraction = activityWatch::onUserInteraction
         root.setViewTreeLifecycleOwner(this)
         root.setViewTreeSavedStateRegistryOwner(this)
         composeView = root.findViewById(R.id.session_compose)
@@ -131,6 +139,7 @@ class SnipVoiceInteractionSession(
             ocrRunner.cancelActiveScan()
             fullScreenScanId.longValue = 0L
         }
+        if (open && !effect.hideImmediately) startActivityWatch(generation)
         apply(effect, generation)
     }
 
@@ -172,6 +181,7 @@ class SnipVoiceInteractionSession(
     }
 
     override fun onHide() {
+        stopActivityWatch()
         showGeneration += 1
         mainHandler.removeCallbacks(timeoutRunnable)
         mainHandler.removeCallbacks(hideRunnable)
@@ -186,6 +196,7 @@ class SnipVoiceInteractionSession(
     }
 
     override fun onDestroy() {
+        stopActivityWatch()
         showGeneration += 1
         mainHandler.removeCallbacksAndMessages(null)
         controller.onDestroy()
@@ -258,22 +269,25 @@ class SnipVoiceInteractionSession(
             overlayScreenshot.value = screenshot
             view.visibility = View.VISIBLE
             view.setContent {
-                SnipTheme {
-                    OverlayScreen(
-                        screenshot = overlayScreenshot.value,
-                        assistStructures = overlayAssist.value,
-                        onScreenshotConsumed = {
-                            ocrRunner.cancelActiveScan()
-                            fullScreenScanId.longValue = 0L
-                            overlayScreenshot.value = null
-                            memory.scrub()
-                        },
-                        onDismiss = ::hide,
-                        displayId = view.display?.displayId ?: Display.DEFAULT_DISPLAY,
-                        ocrRunner = ocrRunner,
-                        fullScreenScanId = fullScreenScanId.longValue,
-                        timing = currentTiming,
-                    )
+                val launchContext = remember(view.context) { SessionActivityContext(view.context, ::hide) }
+                CompositionLocalProvider(LocalContext provides launchContext) {
+                    SnipTheme {
+                        OverlayScreen(
+                            screenshot = overlayScreenshot.value,
+                            assistStructures = overlayAssist.value,
+                            onScreenshotConsumed = {
+                                ocrRunner.cancelActiveScan()
+                                fullScreenScanId.longValue = 0L
+                                overlayScreenshot.value = null
+                                memory.scrub()
+                            },
+                            onDismiss = ::hide,
+                            displayId = view.display?.displayId ?: Display.DEFAULT_DISPLAY,
+                            ocrRunner = ocrRunner,
+                            fullScreenScanId = fullScreenScanId.longValue,
+                            timing = currentTiming,
+                        )
+                    }
                 }
             }
         }
@@ -299,6 +313,27 @@ class SnipVoiceInteractionSession(
         } catch (_: SecurityException) {
             Log.i(TAG, "Delegation activity refused the launch")
         }
+    }
+
+    private fun startActivityWatch(generation: Int) {
+        stopActivityWatch()
+        activityWatch.start()
+        val callback = object : VisibleActivityCallback {
+            override fun onVisible(activityInfo: VisibleActivityInfo) {
+                if (overlayApproved && generation == showGeneration && activityWatch.onVisible(activityInfo.activityId)) hide()
+            }
+            override fun onInvisible(activityId: ActivityId) {
+                if (overlayApproved && generation == showGeneration && activityWatch.onInvisible(activityId)) hide()
+            }
+        }
+        visibleActivityCallback = callback
+        registerVisibleActivityCallback(context.mainExecutor, callback)
+    }
+
+    private fun stopActivityWatch() {
+        activityWatch.stop()
+        visibleActivityCallback?.let { unregisterVisibleActivityCallback(it) }
+        visibleActivityCallback = null
     }
 
     private fun clearViews() {
