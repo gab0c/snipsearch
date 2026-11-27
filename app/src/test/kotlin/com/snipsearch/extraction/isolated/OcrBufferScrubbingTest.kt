@@ -61,6 +61,37 @@ class OcrBufferScrubbingTest {
     }
 
     @Test
+    fun narrowerInferenceScrubsAllPopulatedDataWithoutRewritingRetainedRowTails() {
+        val scratch = DirectFloatScratch()
+        val rows = listOf(scratch.rowBlue(1280), scratch.rowGreen(1280), scratch.rowRed(1280))
+        val wideInput = scratch.floatBuffer(3 * 48 * 1280)
+        val widePlanar = scratch.planarArray(wideInput.capacity())
+        rows.forEach { it.fill(.7f) }
+        wideInput.put(FloatArray(wideInput.capacity()) { .8f })
+        widePlanar.fill(.9f)
+        scratch.scrub(wideInput.capacity(), 1280)
+
+        // Emulate an inference failing after partially filling a much shorter line.
+        val width = 32
+        val usedFloats = 3 * 48 * width
+        try {
+            rows.forEach { it.fill(.4f, 0, width) }
+            scratch.floatBuffer(usedFloats).put(FloatArray(usedFloats) { .5f })
+            scratch.planarArray(usedFloats).fill(.6f, 0, usedFloats)
+            error("inference failure")
+        } catch (_: IllegalStateException) {
+        } finally {
+            scratch.scrub(usedFloats, width)
+        }
+        // Assert full retained capacities, not just the active prefixes.
+        rows.forEach { assertEquals(List(1280) { 0f }, it.toList()) }
+        assertEquals(List(widePlanar.size) { 0f }, widePlanar.toList())
+        wideInput.clear()
+        assertEquals(List(wideInput.capacity()) { 0f }, (0 until wideInput.capacity()).map { wideInput[it] })
+        scratch.scrub()
+    }
+
+    @Test
     fun reusesAndScrubsTextDetectorScratchAcrossSizes() {
         val detectorScratch = TextDetectorScratch()
         val probs = detectorScratch.probsArray(16).also { it.fill(.9f) }
