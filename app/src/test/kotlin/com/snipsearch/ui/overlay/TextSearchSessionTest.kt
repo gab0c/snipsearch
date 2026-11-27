@@ -28,6 +28,7 @@ class TextSearchSessionTest {
         assertFalse(web.settings.javaScriptCanOpenWindowsAutomatically)
         assertTrue(web.settings.mediaPlaybackRequiresUserGesture)
         assertFalse(web.settings.domStorageEnabled)
+        assertTrue(web.settings.javaScriptEnabled)
         assertEquals(android.webkit.WebSettings.LOAD_NO_CACHE, web.settings.cacheMode)
         assertFalse(session.isOpen)
         assertNull(session.target)

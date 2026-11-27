@@ -75,6 +75,8 @@ class BrowserLinkLauncherTest {
         assertFalse(client.shouldOverrideUrlLoading(web, request(redirect = true)))
         assertFalse(client.shouldOverrideUrlLoading(web, request(mainFrame = false)))
         assertFalse(client.shouldOverrideUrlLoading(web, request(method = "POST")))
+        assertTrue(client.shouldOverrideUrlLoading(web, request(gesture = false, uri = clicked)))
+        assertNotNull(client.shouldInterceptRequest(web, request(gesture = false, uri = clicked)))
         assertTrue(launches.isEmpty())
         assertTrue(client.shouldOverrideUrlLoading(web, request()))
         assertEquals(1, launches.size)
@@ -84,8 +86,8 @@ class BrowserLinkLauncherTest {
         session.close()
     }
 
-    private fun request(gesture: Boolean = true, redirect: Boolean = false, mainFrame: Boolean = true, method: String = "GET") = object : WebResourceRequest {
-        override fun getUrl() = clicked
+    private fun request(gesture: Boolean = true, redirect: Boolean = false, mainFrame: Boolean = true, method: String = "GET", uri: Uri? = null) = object : WebResourceRequest {
+        override fun getUrl() = uri ?: if (!gesture || redirect || method == "POST") android.net.Uri.parse("https://www.google.com/search?q=next") else clicked
         override fun isForMainFrame() = mainFrame
         override fun isRedirect() = redirect
         override fun hasGesture() = gesture

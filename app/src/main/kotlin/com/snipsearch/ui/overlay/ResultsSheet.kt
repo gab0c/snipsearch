@@ -83,12 +83,7 @@ internal class ResultsSheet(
         grip.background = GradientDrawable().apply { setColor(foreground); cornerRadius = dp(2).toFloat() }
         message.setTextColor(foreground)
         browser.setTextColor(link)
-        val content = if (session.failed || session.webView == null) failure else requireNotNull(session.webView)
-        if (content.parent !== body) {
-            body.removeAllViews()
-            (content.parent as? android.view.ViewGroup)?.removeView(content)
-            body.addView(content, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        }
+        session.renderInto(body, failure)
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -128,7 +123,7 @@ internal class ResultsSheet(
                 tracker = VelocityTracker.obtain()
                 startX = event.x; startY = event.y; startOffset = sheet.translationY; startMode = mode
                 fromTab = event.y - sheet.translationY < header.height
-                startedAtTop = session.webView?.canScrollVertically(-1) != true
+                startedAtTop = !session.canScrollPageUp()
                 dragging = false; moved = false; pageOwnsGesture = false; gestureActive = true
             }
             MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> if (abs(event.x - startX) > slop || abs(event.y - startY) > slop) moved = true
@@ -155,7 +150,7 @@ internal class ResultsSheet(
         val dy = event.y - startY
         if (abs(dx) <= slop && abs(dy) <= slop) return false
         val canDrag = fromTab || startMode == ResultsPaneMode.REDUCED ||
-            (startedAtTop && dy > slop && abs(dy) > abs(dx) && session.webView?.canScrollVertically(-1) != true)
+            (startedAtTop && dy > slop && abs(dy) > abs(dx) && !session.canScrollPageUp())
         if (!canDrag) { pageOwnsGesture = true; return false }
         dragging = true
         moveTo(event.y)
