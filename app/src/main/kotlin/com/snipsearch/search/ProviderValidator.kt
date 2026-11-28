@@ -233,7 +233,7 @@ internal object ProviderValidator {
         if (!formName.matches(name)) {
             return error(ProviderConfigErrorCode.INVALID_FIELD_NAME, field, "The field name is invalid.")
         }
-        if (ProviderEndpointPolicy.isSensitiveName(name)) {
+        if (name.split('[', ']').any { ProviderEndpointPolicy.isSensitiveName(it) }) {
             return error(ProviderConfigErrorCode.PLAINTEXT_CREDENTIAL, field, "A plaintext credential is not allowed.")
         }
         return null

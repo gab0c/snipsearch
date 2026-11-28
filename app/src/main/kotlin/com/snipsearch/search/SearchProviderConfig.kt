@@ -111,6 +111,10 @@ internal sealed interface SearchProviderConfig {
         val credential: CredentialBinding? = null,
     ) : SearchProviderConfig {
         override val capabilities: Set<ProviderCapability>
-            get() = setOf(ProviderCapability.VISUAL, ProviderCapability.MULTIMODAL_PROMPT)
+            get() = if (requestFormat == VisionRequestFormat.OPENAI_CHAT_COMPLETIONS) {
+                setOf(ProviderCapability.VISUAL, ProviderCapability.MULTIMODAL_PROMPT)
+            } else {
+                setOf(ProviderCapability.VISUAL)
+            }
     }
 }

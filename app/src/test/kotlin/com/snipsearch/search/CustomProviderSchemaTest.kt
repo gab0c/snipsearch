@@ -7,6 +7,23 @@ import org.junit.Test
 
 class CustomProviderSchemaTest {
     @Test
+    fun canonicalSizeAndCapabilities() {
+        val providers = (1..3).map { n ->
+            SearchProviderConfig.RestVisionProvider("custom-$n", "Vision", "https://example.com/v1",
+                VisionRequestFormat.OPENAI_CHAT_COMPLETIONS, modelName = "model", systemPrompt = "\u2028".repeat(4000))
+        }
+        val single = (CustomProviderSchema.encode(providers[0]) as ProviderResult.Valid).value
+        val body = single.substringAfter("\"provider\":").dropLast(1).replace("\\u2028", "\u2028")
+        val literal = "{\"schema\":\"com.snipsearch.providers\",\"version\":1,\"providers\":[" +
+            (1..3).joinToString(",") { body.replace("custom-1", "custom-$it") } + "]}"
+        assertTrue(CustomProviderSchema.decodeList(literal) is ProviderResult.Invalid)
+        val accepted = (CustomProviderSchema.encodeList(providers.take(2)) as ProviderResult.Valid).value
+        assertTrue(CustomProviderSchema.decodeList(accepted) is ProviderResult.Valid)
+        assertEquals(setOf(ProviderCapability.VISUAL), providers[0].copy(
+            requestFormat = VisionRequestFormat.MULTIPART_REDIRECT_JSON).capabilities)
+    }
+
+    @Test
     fun encodesCanonicalDocuments() {
         assertEquals(TEXT_JSON, (CustomProviderSchema.encode(text()) as ProviderResult.Valid).value)
         val browser = SearchProviderConfig.BrowserFormVisualProvider(
@@ -19,6 +36,9 @@ class CustomProviderSchemaTest {
             textSearchUrlTemplate = "https://www.google.com/search?q={searchTerms}",
         )
         assertEquals(BROWSER_JSON, (CustomProviderSchema.encode(browser) as ProviderResult.Valid).value)
+        val sensitiveExtras = browser.copy(extraFormFields = mapOf("auth[token]" to "value"))
+        assertTrue(CustomProviderSchema.encode(sensitiveExtras) is ProviderResult.Invalid)
+        assertTrue(CustomProviderSchema.decode(BROWSER_JSON.replace("\"a\"", "\"auth[token]\"")) is ProviderResult.Invalid)
         val openai = SearchProviderConfig.RestVisionProvider(
             id = "custom-openai",
             displayName = "OpenAI",

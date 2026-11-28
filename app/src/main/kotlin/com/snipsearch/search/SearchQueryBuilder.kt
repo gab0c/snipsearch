@@ -60,39 +60,29 @@ internal object SearchQueryBuilder {
 
     /** Collapses whitespace and rejects empty, oversized, or ill-formed queries. */
     fun normalizeQuery(raw: String): ProviderResult<String> {
-        if (!ProviderEndpointPolicy.isWellFormedUtf16(raw)) {
-            return ProviderResult.Invalid(
-                listOf(error(ProviderConfigErrorCode.MALFORMED_TEXT, "query", "The query text is not well-formed.")),
-            )
-        }
-        val mapped = buildString(raw.length) {
-            for (ch in raw) {
-                val type = Character.getType(ch)
-                if (
-                    Character.isISOControl(ch) ||
-                    Character.isWhitespace(ch) ||
-                    type == Character.SPACE_SEPARATOR.toInt() ||
-                    type == Character.LINE_SEPARATOR.toInt() ||
-                    type == Character.PARAGRAPH_SEPARATOR.toInt()
-                ) {
-                    append(' ')
-                } else {
-                    append(ch)
-                }
+        val builder = StringBuilder(minOf(raw.length, MAX_QUERY_LENGTH + 1))
+        var pending = false
+        for ((index, ch) in raw.withIndex()) {
+            if ((ch.isHighSurrogate() && raw.getOrNull(index + 1)?.isLowSurrogate() != true) ||
+                (ch.isLowSurrogate() && raw.getOrNull(index - 1)?.isHighSurrogate() != true)
+            ) {
+                return ProviderResult.Invalid(
+                    listOf(error(ProviderConfigErrorCode.MALFORMED_TEXT, "query", "The query text is not well-formed.")),
+                )
+            }
+            val type = Character.getType(ch)
+            if (Character.isISOControl(ch) || Character.isWhitespace(ch) ||
+                type == Character.SPACE_SEPARATOR.toInt() || type == Character.LINE_SEPARATOR.toInt() ||
+                type == Character.PARAGRAPH_SEPARATOR.toInt()
+            ) {
+                pending = true
+            } else {
+                if (pending && builder.isNotEmpty() && builder.length <= MAX_QUERY_LENGTH) builder.append(' ')
+                pending = false
+                if (builder.length <= MAX_QUERY_LENGTH) builder.append(ch)
             }
         }
-        val collapsed = buildString(mapped.length) {
-            var pending = false
-            for (ch in mapped.trim()) {
-                if (ch == ' ') {
-                    pending = true
-                } else {
-                    if (pending && isNotEmpty()) append(' ')
-                    pending = false
-                    append(ch)
-                }
-            }
-        }
+        val collapsed = builder.toString()
         if (collapsed.isEmpty()) {
             return ProviderResult.Invalid(
                 listOf(error(ProviderConfigErrorCode.EMPTY_QUERY, "query", "The query is empty.")),

@@ -21,6 +21,8 @@ class SearchQueryBuilderTest {
 
     @Test
     fun normalizesWhitespaceAndRejectsBadQueries() {
+        assertQuery("x".repeat(2050) + "\uD800", ProviderConfigErrorCode.MALFORMED_TEXT)
+        assertEquals("x y", validQuery(" ".repeat(100000) + "x" + " ".repeat(100000) + "y"))
         assertEquals("line1 line2", validQuery("  line1\n\tline2\r\n "))
         assertEquals("x y", validQuery("\u2028x\u00A0y"))
         assertQuery("".let { it }, ProviderConfigErrorCode.EMPTY_QUERY)

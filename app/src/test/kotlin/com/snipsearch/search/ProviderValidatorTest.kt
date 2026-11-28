@@ -34,6 +34,7 @@ class ProviderValidatorTest {
 
     @Test
     fun checksBrowserFormFields() {
+        assertField(browser(file = "auth[token]"), ProviderConfigErrorCode.PLAINTEXT_CREDENTIAL, "fileFormFieldName")
         assertField(browser(file = "api_key"), ProviderConfigErrorCode.PLAINTEXT_CREDENTIAL, "fileFormFieldName")
         assertField(browser(file = "bad field"), ProviderConfigErrorCode.INVALID_FIELD_NAME, "fileFormFieldName")
         assertField(

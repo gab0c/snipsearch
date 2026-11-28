@@ -66,7 +66,12 @@ internal object CustomProviderSchema {
             !is JsonValue.JObject -> envelopeErrors += error(ProviderConfigErrorCode.TYPE_MISMATCH, "provider", "The JSON type does not match.")
             else -> {
                 if (envelopeErrors.isNotEmpty()) return ProviderResult.Invalid(envelopeErrors)
-                return decodeProvider(provider, "provider.")
+                val decoded = decodeProvider(provider, "provider.")
+                if (decoded is ProviderResult.Valid) {
+                    val canonical = encode(decoded.value)
+                    if (canonical is ProviderResult.Invalid) return canonical
+                }
+                return decoded
             }
         }
         return ProviderResult.Invalid(envelopeErrors)
@@ -136,7 +141,10 @@ internal object CustomProviderSchema {
                 }
             }
         }
-        return if (errors.isEmpty()) ProviderResult.Valid(decoded) else ProviderResult.Invalid(errors)
+        if (errors.isNotEmpty()) return ProviderResult.Invalid(errors)
+        val canonical = encodeList(decoded)
+        if (canonical is ProviderResult.Invalid) return canonical
+        return ProviderResult.Valid(decoded)
     }
 
     private fun envelope(schema: String, bodyKey: String, body: JsonValue): JsonValue.JObject =
