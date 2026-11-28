@@ -24,6 +24,24 @@ class UploadImageEncoderTest {
     private val context get() = RuntimeEnvironment.getApplication()
 
     @Test
+    fun hardwareCropPreservesCallerBitmapAfterSuccessfulAndFailedCompression() {
+        val software = Bitmap.createBitmap(12, 10, Bitmap.Config.ARGB_8888)
+        val hardware = requireNotNull(software.copy(Bitmap.Config.HARDWARE, false))
+        try {
+            val crop = PixelRegion(1, 2, 7, 9)
+            requireNotNull(DefaultUploadImageEncoder().encode(hardware, crop, UploadImageFormat.PNG, 100)).use {
+                assertEquals(6, it.width)
+                assertEquals(7, it.height)
+            }
+            assertNull(DefaultUploadImageEncoder(maxEncodedBytes = 12).encode(hardware, crop, UploadImageFormat.PNG, 100))
+            assertFalse(hardware.isRecycled)
+        } finally {
+            hardware.recycle()
+            software.recycle()
+        }
+    }
+
+    @Test
     fun encodesPngAndWebpInRamWithoutMetadataOrDiskWrites() {
         val source = Bitmap.createBitmap(16, 12, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.rgb(42, 128, 200))

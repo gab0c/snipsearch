@@ -2,6 +2,8 @@ package com.snipsearch.search
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import android.net.Uri
 import android.view.ViewGroup
 import android.webkit.WebResourceError
@@ -44,6 +46,9 @@ class WebViewFormUploadBridge(
     private val blobStore = UploadBlobStore(random)
 
     private var ownedWebView: WebView? = null
+    @Volatile
+    private var ownerHandler = Handler(Looper.myLooper() ?: Looper.getMainLooper())
+    private var webAssigned = false
     private var generation = 0L
     private var closed = false
     private var phase = Phase.IDLE
@@ -173,7 +178,16 @@ class WebViewFormUploadBridge(
                         PrepareOutcome.Failed(UploadFailureReason.OFFLINE, nextState)
                     }
                     else -> {
+                        val previousParent = if (webAssigned) {
+                            val retired = ownedWebView
+                            ownedWebView = null
+                            webAssigned = false
+                            val parent = retired?.parent as? ViewGroup
+                            retired?.let(UploadWebViewHardening::release)
+                            parent
+                        } else null
                         val warmOutcome = warmLocked()
+                        if (warmOutcome.success && previousParent != null) attachTo(previousParent)
                         val web = ownedWebView
                         if (!warmOutcome.success || web == null) {
                             activeSubmissionId = 0L
@@ -205,6 +219,7 @@ class WebViewFormUploadBridge(
                                 )
                                 val bootstrapHtml =
                                     UploadBootstrapHtml.generate(validated, registeredBlob, random)
+                                webAssigned = true
                                 activeSubmissionId = submissionId
                                 activeRequest = validated
                                 phase = Phase.BOOTSTRAP_PENDING
@@ -506,6 +521,7 @@ class WebViewFormUploadBridge(
         }
         return try {
             val web = createWebView()
+            ownerHandler = Handler(requireNotNull(Looper.myLooper()))
             UploadWebViewHardening.harden(web)
             web.webViewClient = BridgeWebViewClient()
             ownedWebView = web
@@ -601,29 +617,41 @@ class WebViewFormUploadBridge(
     }
 
     private fun notifyState(state: UploadBridgeState) {
-        onStateChanged?.invoke(state)
+        val listener = onStateChanged ?: return
+        val version = synchronized(lock) { generation }
+        val deliver = Runnable {
+            if (synchronized(lock) { currentState === state && generation == version }) listener(state)
+        }
+        val handler = ownerHandler
+        if (Looper.myLooper() === handler.looper) deliver.run() else handler.post(deliver)
     }
 
     private inner class BridgeWebViewClient : WebViewClient() {
         override fun shouldInterceptRequest(
             view: WebView?,
             request: WebResourceRequest?,
-        ): WebResourceResponse? = handleInterceptRequest(request)
+        ): WebResourceResponse? = synchronized(lock) {
+            if (view == null || view !== ownedWebView) blobStore.blockedBlobResponse()
+            else handleInterceptRequest(request)
+        }
 
         override fun shouldOverrideUrlLoading(
             view: WebView?,
             request: WebResourceRequest?,
-        ): Boolean = handleOverrideUrlLoading(request)
+        ): Boolean = synchronized(lock) {
+            view == null || view !== ownedWebView || handleOverrideUrlLoading(request)
+        }
 
         override fun onReceivedError(
             view: WebView?,
             request: WebResourceRequest?,
             error: WebResourceError?,
         ) {
-            handleReceivedError(
-                request = request,
-                errorCode = error?.errorCode ?: ERROR_UNKNOWN,
-            )
+            synchronized(lock) {
+                if (view != null && view === ownedWebView) {
+                    handleReceivedError(request, error?.errorCode ?: ERROR_UNKNOWN)
+                }
+            }
         }
     }
 

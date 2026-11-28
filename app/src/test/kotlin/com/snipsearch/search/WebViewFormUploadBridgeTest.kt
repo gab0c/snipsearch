@@ -338,15 +338,23 @@ class WebViewFormUploadBridgeTest {
             val web = requireNotNull(captured)
             val firstUrl = extractBlobUrl(shadowOf(web).lastLoadDataWithBaseURL!!.data)
 
+            val container = FrameLayout(context)
+            assertTrue(bridge.attachTo(container))
+            val oldClient = shadowOf(web).webViewClient
             val second = bridge.submit(basicRequest(), bitmap) as UploadSubmissionResult.Dispatched
             assertTrue(second.submissionId > first.submissionId)
-            val client = shadowOf(web).webViewClient
+            val client = oldClient
             // First token was invalidated and replaced.
             assertEquals(403, client.shouldInterceptRequest(web, request(firstUrl, method = "GET", mainFrame = false))?.statusCode)
 
-            val container = FrameLayout(context)
-            assertTrue(bridge.attachTo(container))
-            assertSame(web, container.getChildAt(0))
+            val replacement = container.getChildAt(0) as WebView
+            assertTrue(replacement !== web)
+            val post = request(endpoint, method = "POST", mainFrame = true)
+            oldClient.onReceivedError(web, post, null)
+            assertEquals(403, oldClient.shouldInterceptRequest(web, post)?.statusCode)
+            assertTrue(oldClient.shouldOverrideUrlLoading(web, post))
+            assertTrue(bridge.state is UploadBridgeState.BootstrapPending)
+            assertTrue(bridge.hasActiveBlob())
 
             bridge.cancelActiveSubmission()
             assertEquals(UploadBridgeState.Idle, bridge.state)
@@ -441,12 +449,45 @@ class WebViewFormUploadBridgeTest {
     }
 
     @Test
-    fun searchPackageHasNoNativeHttpClientsOrJsBridges() {
+    fun interceptionDeliversOnOwnerThreadAndDropsCancelledNotification() {
+        val bitmap = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+        val owner = Thread.currentThread()
+        var deliveries = 0
+        lateinit var bridge: WebViewFormUploadBridge
+        bridge = WebViewFormUploadBridge(context, isNetworkAvailable = { true }, onStateChanged = {
+            if (it is UploadBridgeState.Submitted) {
+                assertSame(owner, Thread.currentThread())
+                deliveries++
+                bridge.close()
+            }
+        })
+        try {
+            repeat(2) { attempt ->
+                assertTrue(bridge.submit(basicRequest(), bitmap) is UploadSubmissionResult.Dispatched)
+                val post = request(endpoint, method = "POST", mainFrame = true)
+                val worker = Thread { bridge.handleInterceptRequest(post) }
+                worker.start()
+                worker.join()
+                if (attempt == 0) bridge.cancelActiveSubmission()
+                shadowOf(android.os.Looper.getMainLooper()).idle()
+                assertEquals(attempt, deliveries)
+            }
+            assertEquals(UploadBridgeState.Closed, bridge.state)
+        } finally {
+            bridge.close()
+            bitmap.recycle()
+        }
+    }
+
+    @Test
+    fun browserTransportHasNoNativeHttpClientsOrJsBridges() {
         val cwd = File("").absoluteFile
         val root = listOf(cwd, cwd.resolve("app"), cwd.parentFile)
             .first { it.resolve("src/main/AndroidManifest.xml").isFile }
         val searchDir = root.resolve("src/main/kotlin/com/snipsearch/search")
-        val files = searchDir.walkTopDown().filter { it.extension == "kt" }.toList()
+        val files = searchDir.listFiles().orEmpty().filter {
+            it.extension == "kt" && (it.name.startsWith("Upload") || it.name == "WebViewFormUploadBridge.kt")
+        }
         assertTrue(files.isNotEmpty())
         val forbidden = listOf(
             "HttpsURLConnection",

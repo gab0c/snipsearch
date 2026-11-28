@@ -189,7 +189,7 @@ class DefaultUploadImageEncoder(
         var freshSoftwareTarget: Bitmap? = null
         return try {
             val drawSource = if (bitmap.config == Bitmap.Config.HARDWARE) {
-                bitmap.copy(Bitmap.Config.ARGB_8888, false)?.also { softwareSource = it } ?: return null
+                bitmap.copy(Bitmap.Config.ARGB_8888, true)?.also { softwareSource = it } ?: return null
             } else {
                 bitmap
             }
@@ -202,6 +202,8 @@ class DefaultUploadImageEncoder(
                 Rect(0, 0, targetWidth, targetHeight),
                 Paint(Paint.FILTER_BITMAP_FLAG),
             )
+            scrubBitmap(softwareSource)
+            softwareSource = null
             val (compressFormat, effectiveQuality) = when (format) {
                 UploadImageFormat.PNG -> Bitmap.CompressFormat.PNG to 100
                 UploadImageFormat.WEBP_LOSSLESS -> Bitmap.CompressFormat.WEBP_LOSSLESS to 100
