@@ -16,7 +16,9 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * Envelope layout, before standard Base64: version byte `0x01`, a fresh 12-byte IV,
  * then ciphertext with a 128-bit GCM tag. The version byte is also bound as associated data.
- * All plaintext, IV, and ciphertext buffers stay in RAM and are zeroed after use.
+ * Buffers stay in RAM. Caller-owned plaintext passed to encrypt is not cleared; the caller
+ * controls its lifetime. Decrypted plaintext is adopted by SecretBytes and cleared on close.
+ * Temporary IV and ciphertext buffers are cleared after use.
  * This type does not persist envelopes or wire settings.
  *
  * The production key is StrongBox-backed when that feature is present, with a single
@@ -155,7 +157,7 @@ class KeystoreSecretCipher internal constructor(
         } catch (e: Exception) {
             throw mapKeystoreFailure(e)
         }
-        if (!protection.isHardwareBacked) {
+        if (!protection.isEligible) {
             throw SecretCipherException.HardwareBackingUnavailable(protection)
         }
     }

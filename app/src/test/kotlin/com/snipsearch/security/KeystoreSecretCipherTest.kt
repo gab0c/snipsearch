@@ -265,12 +265,23 @@ class KeystoreSecretCipherTest {
         }
         assertEquals(SecretKeyProtection.UNKNOWN, unknownError.protection)
 
-        val secure = SecretTestKeyBackend().apply {
-            protectionOverride = SecretKeyProtection.UNKNOWN_SECURE
+        val secure = SecretTestKeyBackend()
+        val secureCipher = secretTestCipher(secure)
+        val envelope = secureCipher.encrypt(plaintext)
+        val originalKey = secure.keys[KeystoreSecretCipher.KEY_ALIAS]
+        secure.protectionOverride = SecretKeyProtection.UNKNOWN_SECURE
+        repeat(2) {
+            val encryptError = assertFailsWith<SecretCipherException.HardwareBackingUnavailable> {
+                secureCipher.encrypt(plaintext)
+            }
+            val decryptError = assertFailsWith<SecretCipherException.HardwareBackingUnavailable> {
+                secureCipher.decrypt(envelope).close()
+            }
+            assertEquals(SecretKeyProtection.UNKNOWN_SECURE, encryptError.protection)
+            assertEquals(SecretKeyProtection.UNKNOWN_SECURE, decryptError.protection)
         }
-        secretTestCipher(secure).decrypt(secretTestCipher(secure).encrypt(plaintext)).use {
-            assertArrayEquals(plaintext, it.copyOf())
-        }
+        assertEquals(1, secure.requests.size)
+        assertTrue(secure.keys[KeystoreSecretCipher.KEY_ALIAS] === originalKey)
     }
 
     @Test

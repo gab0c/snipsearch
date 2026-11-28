@@ -9,6 +9,9 @@ enum class SecretKeyProtection(val isHardwareBacked: Boolean) {
     UNKNOWN_SECURE(true),
     SOFTWARE(false),
     UNKNOWN(false),
+    ;
+
+    val isEligible: Boolean get() = this == STRONGBOX || this == TRUSTED_ENVIRONMENT
 }
 
 data class SecretKeyGenerationRequest(
