@@ -15,6 +15,20 @@ import kotlin.math.sin
 
 class GestureIntentClassifierTest {
     @Test
+    fun openRowsAndBoundedDenseStroke() {
+        val words = listOf(Rect(20f, 35f, 100f, 50f), Rect(120f, 35f, 220f, 50f),
+            Rect(20f, 70f, 100f, 85f), Rect(120f, 70f, 220f, 85f))
+        val stroke = listOf(Offset(20f, 40f), Offset(220f, 40f), Offset(220f, 80f), Offset(20f, 80f))
+        assertTrue(classify(stroke, words) is GestureIntent.TextSelection)
+        assertTrue(classify(stroke.reversed(), words) is GestureIntent.TextSelection)
+        val points = mutableListOf<Offset>()
+        repeat(10000) { appendStrokeSample(points, Offset(it.toFloat(), (it % 3).toFloat())) }
+        assertTrue(points.size <= 256)
+        assertEquals(Offset.Zero, points.first())
+        assertEquals(Offset(9999f, 0f), points.last())
+    }
+
+    @Test
     fun closedWobblyRectanglesAroundWordsAreImageCrops() {
         val words = paragraph(lines = 3, top = 120f)
         val clockwise = wobblyRect(40f, 70f, 360f, 250f, clockwise = true)

@@ -75,6 +75,23 @@ internal fun filterStrokeJitter(points: List<Offset>, minStepPx: Float): List<Of
     return kept
 }
 
+
+/** Bounded stroke approximation retaining both endpoints and significant turns. */
+internal fun appendStrokeSample(points: MutableList<Offset>, point: Offset) {
+    points.add(point)
+    if (points.size <= 256) return
+    var remove = 1
+    var smallest = Float.POSITIVE_INFINITY
+    for (i in 1 until points.lastIndex) {
+        val a = points[i - 1]
+        val b = points[i]
+        val c = points[i + 1]
+        val cost = (b - a).getDistance() + (c - b).getDistance() - (c - a).getDistance()
+        if (cost < smallest) { smallest = cost; remove = i }
+    }
+    points.removeAt(remove)
+}
+
 internal fun resolveReleasedGesture(
     released: Boolean,
     rawPoints: List<Offset>,
@@ -151,6 +168,7 @@ private fun detectImageLasso(filtered: List<Offset>, density: Float): Rect? {
     if (loopLength / (2f * (width + height)) < LASSO_MIN_PERIMETER_RATIO) return null
     val endGap = if (loop.crossed) 0f else (loop.points.last() - loop.points.first()).getDistance()
     if (diagonal <= 0f || loopLength <= 0f) return null
+    if (!loop.crossed && endGap >= minOf(width, height) * 0.8f) return null
     if (endGap / diagonal > LASSO_MAX_GAP_TO_DIAGONAL || endGap / loopLength > LASSO_MAX_GAP_TO_PATH) return null
     val signedArea = shoelaceSignedArea(loop.points)
     val enclosedArea = abs(signedArea)

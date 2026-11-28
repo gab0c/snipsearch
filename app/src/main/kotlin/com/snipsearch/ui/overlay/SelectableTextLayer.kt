@@ -220,7 +220,7 @@ internal fun SelectableTextLayer(
                         val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                         if (change.isConsumed) break
                         if (change.position != change.previousPosition) {
-                            rawPoints += change.position
+                            appendStrokeSample(rawPoints, change.position)
                             if (change.pressed) {
                                 trail.extend(change.position, change.uptimeMillis, density)
                                 livePreview = previewGestureIntent(
