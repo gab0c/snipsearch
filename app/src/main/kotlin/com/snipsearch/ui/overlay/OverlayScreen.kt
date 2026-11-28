@@ -280,6 +280,15 @@ internal fun OverlayScreen(
                         onRetryOcr = onRetryOcr,
                         onDismiss = onDismiss,
                         onImageMode = { imageMode = true },
+                        onSuggestCrop = if (!search.isOpen) {
+                            { region ->
+                                imageSelection = region
+                                imageMode = true
+                                cropFailed = false
+                            }
+                        } else {
+                            null
+                        },
                     )
                 }
             }
@@ -312,6 +321,7 @@ private fun BoxScope.TextSelection(
     onRetryOcr: () -> Unit,
     onDismiss: () -> Unit,
     onImageMode: (() -> Unit)? = null,
+    onSuggestCrop: ((PixelRegion) -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val clipLabel = stringResource(R.string.overlay_clip_label)
@@ -377,9 +387,18 @@ private fun BoxScope.TextSelection(
     var activeHandle by remember(resolvedOptions?.words?.map { it.bounds }) { mutableStateOf(SelectionHandle.END) }
     val selected = if (resolvedOptions == null) "" else selectedText(resolvedOptions.blocks, resolvedOptions.words, selection)
     val entities = remember(codes, selected) { (codes + EntityAndQrDetector.extract(selected)).distinct() }
-    if (resolvedOptions?.words?.isNotEmpty() == true) {
-        SelectableTextLayer(resolvedOptions.words, viewport, screen, selection, { selection = it }, Modifier.fillMaxSize(),
-            onActiveHandle = { activeHandle = it })
+    val words = resolvedOptions?.words.orEmpty()
+    if (words.isNotEmpty() || onSuggestCrop != null) {
+        SelectableTextLayer(
+            words = words,
+            viewport = viewport,
+            screen = screen,
+            selection = selection,
+            onSelect = { selection = it },
+            modifier = Modifier.fillMaxSize(),
+            onActiveHandle = { activeHandle = it },
+            onSuggestCrop = onSuggestCrop,
+        )
     }
     if (selected.isNotEmpty() && resolvedOptions != null && !search.isOpen) {
         val rects = resolvedOptions.words.map { viewport.toCanvas(it.bounds.mapBetween(screen, viewport.imageBounds)) }
